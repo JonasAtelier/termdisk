@@ -10,6 +10,7 @@
 mod draw;
 mod guard;
 mod scan;
+mod style;
 mod sys;
 mod trash;
 pub mod tree;
@@ -18,6 +19,7 @@ mod view;
 
 pub use guard::{check, trash, Policy, Refusal, Trashed};
 pub use scan::{scan, Progress, Scan};
+pub use style::{Colors, Depth, IconSet};
 pub use tree::{Node, NodeId, Tree};
 pub use view::{Outcome, View};
 

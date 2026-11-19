@@ -14,6 +14,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::Rect;
 
 use crate::guard::{self, Policy};
+use crate::style::{Colors, IconSet};
 use crate::sys;
 use crate::tree::{Node, NodeId, Tree, HARDLINK_DUP, TRASHED};
 use crate::{scan, Scan};
@@ -59,14 +60,39 @@ pub struct View {
     pub(crate) panes: Panes,
     pub(crate) help: bool,
     pub(crate) message: Option<String>,
+    /// The message says something was done (drawn with a check mark).
+    pub(crate) done: bool,
     /// Where things were drawn last, for the mouse.
     pub(crate) hits: Hits,
     /// The view is drawn here, the size of its area, then copied out: nothing it draws can
     /// land outside the area it was given (a host's other panes stay untouched).
     pub(crate) canvas: Buffer,
     last_click: Option<(Instant, u16, u16)>,
-    /// When a running scan's progress was last asked to be drawn.
+    /// When a running scan's progress was last asked to be drawn, and when the scan started.
     progress_drawn: Instant,
+    pub(crate) scan_started: Instant,
+    pub(crate) colors: Colors,
+    pub(crate) icons: IconSet,
+    /// The treemap is coloured by age rather than by type.
+    pub(crate) by_age: bool,
+    /// Where the mouse pointer was last seen, and what was under it in the last drawing.
+    pub(crate) pointer: Option<(u16, u16)>,
+    pub(crate) hover: Hover,
+}
+
+/// What the pointer is over, as far as drawing it differently goes. Styling only: what a click
+/// does never depends on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Hover {
+    #[default]
+    Nothing,
+    Place(usize),
+    /// A tree row (its index in `Browse::rows`), a tile (in `Hits::tiles`), a status bar item.
+    Row(usize),
+    Tile(usize),
+    Item(usize),
+    Cancel,
+    Move,
 }
 
 pub(crate) enum Screen {
@@ -142,6 +168,13 @@ impl Confirm {
         self.opened.elapsed() >= ARM
     }
 
+    /// Whether a click on "Move to Trash" may move the item: armed and the whole path shown.
+    /// The button is drawn disabled exactly when this is false (the keyboard's `REFOCUS` wait
+    /// is not shown).
+    pub fn clickable(&self) -> bool {
+        self.armed() && self.fits
+    }
+
     /// Whether Enter on "Move to Trash" may move the item now: armed, the whole path shown,
     /// and the focus there for `REFOCUS` (a Tab and an Enter in one burst, as pasted text
     /// brings them where bracketed paste is missing, never confirm).
@@ -159,6 +192,10 @@ pub(crate) struct Hits {
     pub places: Rect,
     /// The dialog's Cancel and Move buttons.
     pub buttons: Option<(Rect, Rect)>,
+    /// The tree's scrollbar column (the wheel scrolls there too; a click does nothing).
+    pub scrollbar: Rect,
+    /// The status bar's items, and the key a click on one presses.
+    pub items: Vec<(Rect, char)>,
 }
 
 impl View {
@@ -171,10 +208,17 @@ impl View {
             panes: Panes::Both,
             help: false,
             message: None,
+            done: false,
             hits: Hits::default(),
             canvas: Buffer::empty(Rect::default()),
+            colors: Colors::default(),
+            icons: IconSet::default(),
             last_click: None,
             progress_drawn: Instant::now(),
+            scan_started: Instant::now(),
+            by_age: false,
+            pointer: None,
+            hover: Hover::Nothing,
         };
         match path {
             Some(p) => view.start_scan(p),
@@ -215,6 +259,7 @@ impl View {
             Ok(s) => {
                 self.screen = Screen::Scanning(s);
                 self.progress_drawn = Instant::now();
+                self.scan_started = self.progress_drawn;
             }
             Err(e) => {
                 self.message = Some(format!("Cannot scan {}: {e}", path.display()));
@@ -299,6 +344,7 @@ impl View {
             return Outcome::Redraw;
         }
         let had_message = self.message.take().is_some();
+        self.done = false;
         let mode = match &self.screen {
             Screen::Start(_) => Mode::Start,
             Screen::Scanning(_) => Mode::Scanning,
@@ -397,6 +443,7 @@ impl View {
                 b.sorted.clear();
                 b.rebuild(Some(sel));
             }
+            KeyCode::Char('t') => self.by_age = !self.by_age,
             KeyCode::Char('r') => {
                 let root = b.tree.root_path().to_path_buf();
                 self.start_scan(&root);
@@ -468,8 +515,19 @@ impl View {
         let Some(c) = b.confirm.take() else {
             return;
         };
+        let n = *b.tree.node(c.id);
+        let size = crate::fmt_size(if self.apparent { n.apparent } else { n.alloc });
+        let what = if n.is_dir() {
+            format!("{} items, {size}", n.items)
+        } else {
+            size
+        };
+        let name = crate::draw::shown(b.tree.name(c.id));
+        // Shown until the next key or click (no timer); that key or click also does its own
+        // work, as with every message.
         self.message = Some(match guard::trash(&b.tree, c.id, &self.policy) {
-            Ok(t) => {
+            Ok(_) => {
+                self.done = true;
                 b.tree.mark_trashed(c.id);
                 b.sorted.clear();
                 if c.id == b.zoom {
@@ -478,10 +536,7 @@ impl View {
                 let at = b.cursor;
                 b.rebuild(None);
                 b.cursor = at.min(b.rows.len() - 1);
-                format!(
-                    "Moved to the trash: {} (the file manager can put it back; the space is freed when the trash is emptied)",
-                    t.from.display()
-                )
+                format!("Moved to the trash: {name}, {what} - freed when the trash is emptied")
             }
             Err(r) => format!("Not moved: {r}"),
         });
@@ -492,10 +547,20 @@ impl View {
         let inside = |r: Rect| x >= r.x && x < r.right() && y >= r.y && y < r.bottom();
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {}
+            // Drawn again only when what is under the pointer changes.
+            MouseEventKind::Moved => {
+                self.pointer = Some((x, y));
+                let h = self.hover_at(x, y);
+                return match mem::replace(&mut self.hover, h) != h {
+                    true => Outcome::Redraw,
+                    false => Outcome::None,
+                };
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let up = m.kind == MouseEventKind::ScrollUp;
+                let tree = inside(self.hits.rows) || inside(self.hits.scrollbar);
                 if let Screen::Browse(b) = &mut self.screen {
-                    if b.confirm.is_none() && inside(self.hits.rows) {
+                    if b.confirm.is_none() && tree {
                         b.cursor = match up {
                             true => b.cursor.saturating_sub(3),
                             false => (b.cursor + 3).min(b.rows.len() - 1),
@@ -518,6 +583,14 @@ impl View {
             return Outcome::Redraw;
         }
         self.message = None;
+        self.done = false;
+        let item = self.hits.items.iter().find(|i| inside(i.0)).map(|i| i.1);
+        let browsing = matches!(&self.screen, Screen::Browse(b) if b.confirm.is_none());
+        if let Some(k) = item.filter(|_| browsing) {
+            // A status bar item does what its key does.
+            self.browse_key(KeyEvent::new(KeyCode::Char(k), KeyModifiers::NONE));
+            return Outcome::Redraw;
+        }
         match &mut self.screen {
             Screen::Start(s) if inside(self.hits.places) => {
                 let row = usize::from(y - self.hits.places.y);
@@ -533,7 +606,7 @@ impl View {
                     return Outcome::None;
                 };
                 // A click is aimed: no wait for the focus, but armed and the whole path shown.
-                let ok = b.confirm.as_ref().is_some_and(|c| c.armed() && c.fits);
+                let ok = b.confirm.as_ref().is_some_and(Confirm::clickable);
                 if inside(cancel) {
                     b.confirm = None;
                 } else if inside(moving) && ok {
@@ -574,6 +647,51 @@ impl View {
             _ => return Outcome::None,
         }
         Outcome::Redraw
+    }
+
+    /// What is under (x, y) in the last drawing, for hover: the same places, in the same order,
+    /// as a click looks for them in `handle_mouse`.
+    pub(crate) fn hover_at(&self, x: u16, y: u16) -> Hover {
+        let inside = |r: Rect| x >= r.x && x < r.right() && y >= r.y && y < r.bottom();
+        let h = &self.hits;
+        if self.help {
+            return Hover::Nothing;
+        }
+        match &self.screen {
+            Screen::Start(s) if inside(h.places) => match usize::from(y - h.places.y) {
+                row if row < s.places.len() => Hover::Place(row),
+                _ => Hover::Nothing,
+            },
+            Screen::Browse(b) if b.confirm.is_some() => match h.buttons {
+                Some((cancel, _)) if inside(cancel) => Hover::Cancel,
+                Some((_, moving)) if inside(moving) => Hover::Move,
+                _ => Hover::Nothing,
+            },
+            Screen::Browse(_) if h.items.iter().any(|i| inside(i.0)) => {
+                Hover::Item(h.items.iter().position(|i| inside(i.0)).unwrap_or(0))
+            }
+            Screen::Browse(b) if inside(h.rows) => match b.top + usize::from(y - h.rows.y) {
+                row if row < b.rows.len() => Hover::Row(row),
+                _ => Hover::Nothing,
+            },
+            Screen::Browse(_) => h
+                .tiles
+                .iter()
+                .position(|t| inside(t.0))
+                .map_or(Hover::Nothing, Hover::Tile),
+            _ => Hover::Nothing,
+        }
+    }
+
+    /// The colours to draw with (the default is termcode's; a host passes its own, already
+    /// fitted to the terminal, or fits the frame afterwards as termcode does).
+    pub fn set_colors(&mut self, colors: Colors) {
+        self.colors = colors;
+    }
+
+    /// The glyphs to draw with (default: Unicode, which any font has).
+    pub fn set_icons(&mut self, icons: IconSet) {
+        self.icons = icons;
     }
 
     /// Draws the view into `buf`, over `area`.
@@ -1089,6 +1207,488 @@ mod tests {
         }
     }
 
+    /// One view on each screen: start, scanning, the tree, the dialog, the keys, a refusal; and
+    /// what Round B added: the map by age, a tree long enough for its scrollbar, the message
+    /// after a trash, and the pointer over a row, a tile, a status item, a button.
+    fn every_screen(home: &Path) -> Vec<View> {
+        let cache = home.join(".cache");
+        let mut dialog = ready(policy(home, None), &cache);
+        key(&mut dialog, KeyCode::Delete);
+        let mut help = ready(policy(home, None), &cache);
+        key(&mut help, KeyCode::Char('?'));
+        let mut message = ready(policy(home, None), home);
+        select(&mut message, ".config");
+        key(&mut message, KeyCode::Delete);
+        let mut by_age = ready(policy(home, None), &cache);
+        key(&mut by_age, KeyCode::Char('t'));
+        let mut long = ready(policy(home, None), &cache);
+        let f0 = browse(&mut long)
+            .tree
+            .find(&cache.join("big/inner/f0"))
+            .unwrap();
+        browse(&mut long).select(f0);
+        fs::write(cache.join("done"), b"x").unwrap(); // each call trashes its own
+        let mut trashed = ready(policy(home, None), &cache);
+        select(&mut trashed, "done");
+        key(&mut trashed, KeyCode::Delete);
+        age(&mut trashed);
+        let (_, moving) = trashed.hits.buttons.unwrap();
+        trashed.last_click = None;
+        click(&mut trashed, moving.x + 2, moving.y);
+        assert!(trashed
+            .message
+            .as_ref()
+            .unwrap()
+            .contains("Moved to the trash"));
+        let mut views = vec![
+            View::new(policy(home, None), None),
+            View::new(policy(home, None), Some(&cache)),
+            ready(policy(home, None), &cache),
+            dialog,
+            help,
+            message,
+            by_age,
+            long,
+            trashed,
+        ];
+        // The pointer over a row, a tile, a status item, Cancel and Move.
+        let mut hovered = Vec::new();
+        for spot in 0..4 {
+            let mut v = ready(policy(home, None), &cache);
+            if spot == 3 {
+                key(&mut v, KeyCode::Delete);
+                age(&mut v);
+            }
+            text(&mut v, 120, 40);
+            let (x, y) = match spot {
+                0 => (v.hits.rows.x + 2, v.hits.rows.y + 1),
+                1 => (v.hits.tiles[0].0.x + 1, v.hits.tiles[0].0.y),
+                2 => (v.hits.items[0].0.x, v.hits.items[0].0.y),
+                _ => (v.hits.buttons.unwrap().1.x + 1, v.hits.buttons.unwrap().1.y),
+            };
+            hover(&mut v, x, y);
+            assert_ne!(v.hover, Hover::Nothing, "spot {spot}");
+            hovered.push(v);
+        }
+        views.extend(hovered);
+        views
+    }
+
+    fn hover(v: &mut View, x: u16, y: u16) -> Outcome {
+        v.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn every_icon_set_and_colour_depth_draws_at_every_size() {
+        use crate::style::{Colors, Depth};
+        let (_t, home) = home("view-sets");
+        let looks = [
+            (IconSet::Nerd, Depth::True),
+            (IconSet::Unicode, Depth::C256),
+            (IconSet::Ascii, Depth::C16),
+        ];
+        for (set, depth) in looks {
+            for v in &mut every_screen(&home) {
+                v.set_icons(set);
+                v.set_colors(Colors::default().fitted(depth));
+                for w in 0..=60 {
+                    for h in 0..=12 {
+                        let area = Rect::new(0, 0, w, h);
+                        v.draw(area, &mut Buffer::empty(area));
+                    }
+                }
+                // Inside a host's larger buffer: nothing outside its area changes.
+                for area in [
+                    Rect::new(10, 5, 30, 8),
+                    Rect::new(0, 0, 7, 3),
+                    Rect::new(70, 25, 20, 10),
+                    Rect::new(3, 2, 76, 26),
+                ] {
+                    let all = Rect::new(0, 0, 80, 30);
+                    let mut buf = Buffer::empty(all);
+                    for c in buf.content.iter_mut() {
+                        c.set_symbol("X");
+                    }
+                    v.draw(area, &mut buf);
+                    let mine = area.intersection(all);
+                    for (i, c) in buf.content.iter().enumerate() {
+                        let (x, y) = ((i % 80) as u16, (i / 80) as u16);
+                        let inside =
+                            x >= mine.x && x < mine.right() && y >= mine.y && y < mine.bottom();
+                        assert!(inside || c.symbol() == "X", "({x}, {y}) for {area:?}");
+                    }
+                }
+                let lines = text(v, 120, 40);
+                if set == IconSet::Ascii {
+                    let odd: Vec<&String> = lines.iter().filter(|l| !l.is_ascii()).collect();
+                    assert!(odd.is_empty(), "ASCII only: {odd:#?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hover_redraws_only_when_the_thing_under_the_pointer_changes() {
+        let (_t, home) = home("view-hover");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        let buf = draw_buf(&mut v, 120, 40);
+        let rows = v.hits.rows;
+        let (x, y) = (rows.x + 3, rows.y + 2); // a row that is not selected
+        assert_eq!(buf[(x, y)].bg, v.colors.side_bg);
+        assert_eq!(hover(&mut v, x, y), Outcome::Redraw, "onto a row");
+        assert_eq!(hover(&mut v, x + 5, y), Outcome::None, "along the same row");
+        let buf = draw_buf(&mut v, 120, 40);
+        assert_eq!(buf[(x, y)].bg, v.colors.hover_bg);
+        assert_eq!(buf[(x, y + 1)].bg, v.colors.side_bg, "only that row");
+        assert_eq!(
+            hover(&mut v, x, y + 1),
+            Outcome::Redraw,
+            "onto the next row"
+        );
+        let tile = v.hits.tiles[0].0;
+        assert_eq!(
+            hover(&mut v, tile.x, tile.y),
+            Outcome::Redraw,
+            "onto a tile"
+        );
+        assert_eq!(hover(&mut v, tile.right() - 1, tile.y), Outcome::None);
+        let item = v.hits.items[1].0;
+        assert_eq!(hover(&mut v, item.x, item.y), Outcome::Redraw);
+        let buf = draw_buf(&mut v, 120, 40);
+        assert_eq!(buf[(item.x, item.y)].bg, v.colors.status_hover);
+        // A drawing after a key keeps what is under the pointer, so a still pointer costs
+        // nothing more.
+        key(&mut v, KeyCode::Down);
+        draw_buf(&mut v, 120, 40);
+        assert_eq!(hover(&mut v, item.x, item.y), Outcome::None);
+        // With the dialog open, the rows under it show no hover.
+        key(&mut v, KeyCode::Delete);
+        assert_eq!(hover(&mut v, x, y), Outcome::Redraw, "off the status item");
+        let buf = draw_buf(&mut v, 120, 40);
+        assert_eq!(v.hover, Hover::Nothing);
+        assert_ne!(buf[(x, y)].bg, v.colors.hover_bg);
+        // A click on a status item does what its key does.
+        key(&mut v, KeyCode::Esc);
+        draw_buf(&mut v, 120, 40);
+        let by_type = v.hits.items[1];
+        assert_eq!(by_type.1, 't');
+        click(&mut v, by_type.0.x + 1, by_type.0.y);
+        assert!(v.by_age);
+        assert!(has(&text(&mut v, 120, 40), "t: by age"));
+    }
+
+    #[test]
+    fn the_scrollbar_and_the_tile_outline_take_no_clicks_from_their_neighbours() {
+        let (_t, home) = home("view-bars");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &cache);
+        let f0 = browse(&mut v)
+            .tree
+            .find(&cache.join("big/inner/f0"))
+            .unwrap();
+        browse(&mut v).select(f0); // big and inner open: more rows than the pane shows
+        let buf = draw_buf(&mut v, 120, 12);
+        let (rows, bar) = (v.hits.rows, v.hits.scrollbar);
+        assert_eq!(bar.x, rows.right(), "the scrollbar is outside the rows");
+        assert!(browse(&mut v).rows.len() > rows.height as usize);
+        let slider = (bar.y..bar.bottom()).filter(|&y| buf[(bar.x, y)].symbol() == "┃");
+        assert!(slider.count() >= 1, "the slider shows");
+        // A click anywhere on the scrollbar column selects nothing and opens nothing.
+        let (cursor, open) = (browse(&mut v).cursor, browse(&mut v).open.clone());
+        for y in bar.y..bar.bottom() {
+            v.last_click = None;
+            assert_eq!(click(&mut v, bar.x, y), Outcome::None);
+            let b = browse(&mut v);
+            assert_eq!((b.cursor, &b.open), (cursor, &open), "row {y}");
+        }
+        // The wheel scrolls there too.
+        v.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: bar.x,
+            row: bar.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(browse(&mut v).cursor < cursor);
+        // Every cell of the selected tile's outline selects that tile, in every class mode.
+        for t in [false, true] {
+            let mut v = ready(policy(&home, None), &cache);
+            v.by_age = t;
+            select(&mut v, "big");
+            let buf = draw_buf(&mut v, 120, 40);
+            let b = browse(&mut v);
+            let big = b.rows[b.cursor].0;
+            let tile = v.hits.tiles.iter().find(|t| t.1 == Some(big)).unwrap().0;
+            assert_eq!(buf[(tile.x, tile.y)].symbol(), "╭", "the outline");
+            for (x, y) in (tile.x..tile.right())
+                .flat_map(|x| [(x, tile.y), (x, tile.bottom() - 1)])
+                .chain((tile.y..tile.bottom()).flat_map(|y| [(tile.x, y), (tile.right() - 1, y)]))
+            {
+                select(&mut v, "small");
+                v.last_click = None;
+                click(&mut v, x, y);
+                assert_eq!(selected_name(&mut v), "big", "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn the_map_shows_its_classes_by_letter_without_colour() {
+        use crate::style::{Colors, Depth};
+        let (_t, home) = home("view-classes");
+        let cache = home.join(".cache");
+        fs::write(cache.join("clip.MP4"), vec![0u8; 50_000]).unwrap();
+        for (by_age, legend) in [
+            (false, ["/ folder", "V video", "O other"]),
+            (true, ["W this week"; 3]),
+        ] {
+            let mut v = ready(policy(&home, None), &cache);
+            v.set_icons(IconSet::Ascii);
+            v.set_colors(Colors::default().fitted(Depth::C16));
+            v.by_age = by_age;
+            let lines = text(&mut v, 120, 40);
+            let map: Vec<String> = lines.iter().map(|l| l.chars().skip(61).collect()).collect();
+            for l in legend {
+                assert!(map[1].contains(l), "legend {l:?}: {:?}", map[1]);
+            }
+            for (r, id) in v.hits.tiles.clone() {
+                let Some(id) = id else { continue };
+                let name = browse(&mut v).tree.name(id).to_string_lossy().into_owned();
+                let want = match (by_age, name.as_str()) {
+                    (true, _) => "W",
+                    (false, "big") => "/",
+                    (false, "clip.MP4") => "V",
+                    _ => "O",
+                };
+                let label: String = (r.x + 1..r.x + 3)
+                    .map(|x| text_at(&lines, x, r.y))
+                    .collect();
+                assert_eq!(label, format!("{want} "), "{name}");
+            }
+        }
+    }
+
+    fn text_at(lines: &[String], x: u16, y: u16) -> String {
+        lines[y as usize]
+            .chars()
+            .nth(x as usize)
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn the_scan_card_turns_its_spinner_once_per_progress_redraw() {
+        let (_t, home) = home("view-spin");
+        let mut v = View::new(policy(&home, None), Some(&home));
+        assert_eq!(v.next_wake(), Some(SCAN_CHECK));
+        v.scan_started = Instant::now(); // the spinner's first frame, whatever the machine
+        let first = text(&mut v, 120, 40);
+        let line = |l: &[String]| l.iter().find(|l| l.contains(" files ")).unwrap().clone();
+        assert!(
+            line(&first).contains("⠋ ") && has(&first, "items/s"),
+            "{first:#?}"
+        );
+        v.scan_started -= PROGRESS; // the next redraw, 100 ms later
+        assert!(line(&text(&mut v, 120, 40)).contains("⠙ "));
+        // The tree replaces it: no spinner, nothing to wake for.
+        while v.next_wake().is_some() {
+            v.tick();
+            sleep(Duration::from_millis(1));
+        }
+        assert!(!has(&text(&mut v, 120, 40), "items/s"));
+    }
+
+    #[test]
+    fn the_message_after_a_trash_stays_until_a_key_or_a_click() {
+        let (_t, home) = home("view-done");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        select(&mut v, "small");
+        key(&mut v, KeyCode::Delete);
+        age(&mut v);
+        key(&mut v, KeyCode::Tab);
+        browse(&mut v).confirm.as_mut().unwrap().focused -= REFOCUS;
+        key(&mut v, KeyCode::Enter);
+        let msg = v.message.clone().unwrap();
+        assert_eq!(
+            msg,
+            "Moved to the trash: small, 4.1 kB - freed when the trash is emptied"
+        );
+        assert_eq!(v.next_wake(), None, "no timer");
+        let lines = text(&mut v, 120, 40);
+        assert!(
+            lines[39].starts_with(" ✓ Moved to the trash"),
+            "in the status bar, with the set's check mark"
+        );
+        v.set_icons(IconSet::Ascii);
+        assert!(text(&mut v, 120, 40)[39].starts_with(" + Moved"));
+        hover(&mut v, 5, 5);
+        assert!(v.message.is_some(), "the pointer does not dismiss it");
+        let before = browse(&mut v).cursor;
+        key(&mut v, KeyCode::Up);
+        assert!(v.message.is_none() && !v.done, "a key does");
+        assert_ne!(browse(&mut v).cursor, before, "and does its own work too");
+    }
+
+    #[test]
+    fn a_refusal_after_a_trash_shows_without_the_check_mark() {
+        let (_t, home) = home("view-done-refused");
+        let mut v = ready(policy(&home, None), &home);
+        select(&mut v, "Downloads");
+        key(&mut v, KeyCode::Right);
+        select(&mut v, "linked");
+        key(&mut v, KeyCode::Delete);
+        age(&mut v);
+        key(&mut v, KeyCode::Tab);
+        browse(&mut v).confirm.as_mut().unwrap().focused -= REFOCUS;
+        key(&mut v, KeyCode::Enter);
+        assert!(v.done);
+        select(&mut v, ".config");
+        key(&mut v, KeyCode::Delete);
+        assert!(!v.done && v.message.as_ref().unwrap().contains("protected"));
+        let line = &text(&mut v, 120, 40)[39];
+        assert!(line.starts_with(" Cannot move to the trash"), "{line}");
+    }
+
+    fn draw_buf(v: &mut View, w: u16, h: u16) -> Buffer {
+        let area = Rect::new(0, 0, w, h);
+        let mut buf = Buffer::empty(area);
+        v.draw(area, &mut buf);
+        buf
+    }
+
+    /// The text attributes of the cell in the middle of `r`.
+    fn mods(buf: &Buffer, r: Rect) -> ratatui::style::Modifier {
+        buf[(r.x + r.width / 2, r.y)].modifier
+    }
+
+    #[test]
+    fn the_selection_the_lock_and_the_focus_show_without_colour() {
+        use crate::style::{Colors, Depth};
+        use ratatui::style::Modifier;
+        let (_t, home) = home("view-cues");
+        let c16 = Colors::default().fitted(Depth::C16);
+        for (set, mark, lock) in [(IconSet::Unicode, "▌", "⊘"), (IconSet::Ascii, ">", "!")] {
+            let mut v = ready(policy(&home, None), &home);
+            v.set_icons(set);
+            v.set_colors(c16);
+            select(&mut v, ".config");
+            let buf = draw_buf(&mut v, 120, 40);
+            let rows = v.hits.rows;
+            let b = browse(&mut v);
+            let y = rows.y + (b.cursor - b.top) as u16;
+            assert_eq!(
+                buf[(rows.x, y)].symbol(),
+                mark,
+                "{set:?}: the selection's mark"
+            );
+            assert!(buf[(rows.x + 4, y)].modifier.contains(Modifier::BOLD));
+            let row: String = (0..60).map(|x| buf[(x, y)].symbol()).collect();
+            assert!(row.contains(&format!(".config/ {lock}")), "{set:?}: {row}");
+            // The dialog: focus is bold, a Move to Trash that cannot be used is crossed out.
+            let mut v = ready(policy(&home, None), &home.join(".cache"));
+            v.set_icons(set);
+            v.set_colors(c16);
+            key(&mut v, KeyCode::Delete);
+            let buf = draw_buf(&mut v, 120, 40);
+            let (cancel, moving) = v.hits.buttons.unwrap();
+            assert!(mods(&buf, cancel).contains(Modifier::BOLD));
+            assert!(
+                mods(&buf, moving).contains(Modifier::CROSSED_OUT),
+                "not armed yet"
+            );
+            age(&mut v);
+            let buf = draw_buf(&mut v, 120, 40);
+            assert!(!mods(&buf, moving).intersects(Modifier::CROSSED_OUT | Modifier::BOLD));
+            v.tick(); // draws the armed look, as the loop does
+            key(&mut v, KeyCode::Tab);
+            assert_eq!(v.next_wake(), None, "the keyboard's wait is not shown");
+            let buf = draw_buf(&mut v, 120, 40);
+            assert!(!mods(&buf, cancel).contains(Modifier::BOLD));
+            let m = mods(&buf, moving);
+            assert!(
+                m.contains(Modifier::BOLD) && !m.contains(Modifier::CROSSED_OUT),
+                "focused, and a click would move it: not drawn disabled"
+            );
+        }
+    }
+
+    /// The Move to Trash button in each state of the dialog: drawn disabled exactly when a
+    /// click on it moves nothing, with the pointer resting on either button or on neither.
+    #[test]
+    fn rule7_drawn_disabled_exactly_when_a_click_moves_nothing() {
+        use ratatui::style::Modifier;
+        #[derive(Debug, Clone, Copy)]
+        enum State {
+            JustOpened,
+            ArmedOnCancel,
+            JustAfterTab,
+            AfterRefocus,
+            PathDoesNotFit,
+        }
+        for state in [
+            State::JustOpened,
+            State::ArmedOnCancel,
+            State::JustAfterTab,
+            State::AfterRefocus,
+            State::PathDoesNotFit,
+        ] {
+            for hover in [None, Some(0), Some(1)] {
+                let (_t, home) = home("view-states");
+                let f = long_item(&home);
+                let mut v = ready(policy(&home, None), &home.join(".cache"));
+                ask_for(&mut v, &f);
+                let c = browse(&mut v).confirm.as_mut().unwrap();
+                match state {
+                    State::JustOpened => {}
+                    State::ArmedOnCancel | State::PathDoesNotFit => c.opened -= ARM,
+                    State::JustAfterTab | State::AfterRefocus => {
+                        c.opened -= ARM;
+                        key(&mut v, KeyCode::Tab);
+                    }
+                }
+                if let State::AfterRefocus = state {
+                    browse(&mut v).confirm.as_mut().unwrap().focused -= REFOCUS;
+                }
+                // 60x8: room for the buttons, not for this path.
+                let (w, h) = match state {
+                    State::PathDoesNotFit => (60, 8),
+                    _ => (120, 40),
+                };
+                draw_buf(&mut v, w, h);
+                let (cancel, moving) = v.hits.buttons.unwrap();
+                if let Some(i) = hover {
+                    let r = [cancel, moving][i];
+                    v.handle_mouse(MouseEvent {
+                        kind: MouseEventKind::Moved,
+                        column: r.x + 2,
+                        row: r.y,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                }
+                let buf = draw_buf(&mut v, w, h);
+                let under = [Hover::Cancel, Hover::Move];
+                assert_eq!(v.hover, hover.map_or(Hover::Nothing, |i| under[i]));
+                let c = browse(&mut v).confirm.as_ref().unwrap();
+                assert_eq!(c.fits, !matches!(state, State::PathDoesNotFit));
+                let disabled = mods(&buf, moving).contains(Modifier::CROSSED_OUT);
+                // A disabled button never takes the hover colour.
+                let lit = buf[(moving.x + 2, moving.y)].bg;
+                let k = v.colors;
+                assert!(!(disabled && (lit == k.button_hover || lit == k.button2_hover)));
+                v.last_click = None;
+                click(&mut v, moving.x + 2, moving.y);
+                let moved = !f.exists();
+                assert_eq!(disabled, !moved, "{state:?}, pointer on {hover:?}");
+                let expect = matches!(state, State::JustOpened | State::PathDoesNotFit);
+                assert_eq!(disabled, expect, "{state:?}");
+            }
+        }
+    }
+
     #[test]
     fn rule7_a_click_moves_it_only_once_armed() {
         let (_t, home) = home("view-click");
@@ -1130,7 +1730,10 @@ mod tests {
         let mut v = ready(policy(&home, None), &home);
         select(&mut v, ".config");
         let lines = text(&mut v, 120, 40);
-        assert!(has(&lines, ".config/ 🔒"));
+        assert!(
+            has(&lines, ".config/ ⊘"),
+            "the one-cell lock of the Unicode set"
+        );
         key(&mut v, KeyCode::Delete);
         assert!(browse(&mut v).confirm.is_none());
         let msg = v.message.clone().unwrap();
@@ -1358,5 +1961,63 @@ mod tests {
             matches!(v.screen, Screen::Scanning(_)),
             "the cache is scanned"
         );
+    }
+
+    /// Prints the start screen, the tree and the dialog at 120x40, in Unicode and in ASCII,
+    /// to look at: `cargo test -- --ignored --nocapture print_screens`.
+    #[test]
+    #[ignore = "prints screens to look at"]
+    fn print_screens() {
+        let (_t, home) = home("view-print");
+        let day = Duration::from_secs(86_400);
+        for (dir, size, days) in [
+            ("Videos/trip.mp4", 2_400_000, 3),
+            ("projects/app/target/debug.bin", 1_300_000, 20),
+            (".local/share/app/data.db", 700_000, 200),
+            ("Downloads/linux.iso", 1_800_000, 400),
+            ("Downloads/clip.mkv", 900_000, 2),
+            ("Downloads/photo.jpg", 600_000, 15),
+            ("Downloads/song.mp3", 450_000, 100),
+            ("Downloads/notes.pdf", 300_000, 800),
+            ("Downloads/data.bin", 200_000, 50),
+            ("Downloads/script.py", 120_000, 1),
+        ] {
+            let p = home.join(dir);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, vec![0u8; size]).unwrap();
+            let f = fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(std::time::SystemTime::now() - day * days)
+                .unwrap();
+        }
+        let show = |title: &str, v: &mut View| {
+            println!("--- {title}");
+            for l in text(v, 120, 40) {
+                println!("{}", l.trim_end());
+            }
+        };
+        for set in [IconSet::Unicode, IconSet::Ascii] {
+            let mut start = View::new(policy(&home, None), None);
+            start.set_icons(set);
+            show(&format!("start, {set:?}"), &mut start);
+            let mut main = ready(policy(&home, None), &home);
+            main.set_icons(set);
+            select(&mut main, "Downloads");
+            key(&mut main, KeyCode::Enter);
+            show(&format!("tree, by type, {set:?}"), &mut main);
+            key(&mut main, KeyCode::Char('t'));
+            show(&format!("tree, by age, {set:?}"), &mut main);
+            let mut scanning = View::new(policy(&home, None), Some(&home));
+            scanning.set_icons(set);
+            show(&format!("scanning, {set:?}"), &mut scanning);
+            let mut d = ready(policy(&home, None), &home.join(".cache"));
+            d.set_icons(set);
+            key(&mut d, KeyCode::Delete);
+            show(&format!("dialog just opened, {set:?}"), &mut d);
+            age(&mut d);
+            key(&mut d, KeyCode::Tab);
+            browse(&mut d).confirm.as_mut().unwrap().focused -= REFOCUS;
+            key(&mut d, KeyCode::Enter);
+            show(&format!("after a trash, {set:?}"), &mut d);
+        }
     }
 }
