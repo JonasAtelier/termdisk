@@ -10,6 +10,12 @@ What changed in each termdisk release, newest first. The version rule is in `AGE
   other way). Names go A to Z with capitals and small letters together; the other columns
   start largest or newest first. The heading sorted by has an arrow. The default is still
   size, largest first, and the selection stays on its item.
+- In the tree, folders come first in every folder, then the files and the rest, each in the
+  sorted order (turning the order round keeps the folders on top).
+- The tree's levels have colours: each level of the indent has a guide line (`│`, or `|` in
+  ASCII), and the guides, chevrons and folder icons take VS Code's bracket pair colours by
+  level in turn (gold, orchid, blue; fitted to 256 and 16 colours, neighbouring levels
+  differing). The selected row keeps its own colours. Library: `Colors::depth`.
 - The Usage column shows the share of its folder as a percentage before the bar ("41%";
   "<1%" below half a percent, ">99%" for nearly all, "100%" only for all); the bar is 8 cells.
   A narrow tree keeps the column it is sorted by.

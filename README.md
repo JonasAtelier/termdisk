@@ -8,12 +8,12 @@ caches and temporary files.
                  ~/Downloads  —  4.4 MB (disk usage)  —  termdisk
  Name                            Usage     Size▾   Modified   Downloads/ · V video I image A audio Z archive D doc T
  ▾ Downloads/ ⊘          100% ━━━━━━━━    4.4 MB 2026-11-19  ╭Z linux.iso─────────────────────────────────────────────╮
-▌    ▪ linux.iso          41% ━━━╸────    1.8 MB 2025-10-15  │1.8 MB                                                  │
-     ▪ clip.mkv           20% ━╸──────  901.1 kB 2026-11-17  │                                                        │
-     ▪ photo.jpg          14% ━───────  602.1 kB 2026-11-04  ╰────────────────────────────────────────────────────────╯
-     ▪ song.mp3           10% ━───────  450.6 kB 2026-08-11   V clip.mkv                   A song.mp3
-     ▪ notes.pdf           7% ╸───────  303.1 kB 2024-09-10   901.1 kB                     450.6 kB
-     ▪ script.py           3% ────────  122.9 kB 2026-11-18   I photo.jpg                  D notes.pdf   T script.py
+▌│   ▪ linux.iso          41% ━━━╸────    1.8 MB 2025-10-15  │1.8 MB                                                  │
+ │   ▪ clip.mkv           20% ━╸──────  901.1 kB 2026-11-17  │                                                        │
+ │   ▪ photo.jpg          14% ━───────  602.1 kB 2026-11-04  ╰────────────────────────────────────────────────────────╯
+ │   ▪ song.mp3           10% ━───────  450.6 kB 2026-08-11   V clip.mkv                   A song.mp3
+ │   ▪ notes.pdf           7% ╸───────  303.1 kB 2024-09-10   901.1 kB                     450.6 kB
+ │   ▪ script.py           3% ────────  122.9 kB 2026-11-18   I photo.jpg                  D notes.pdf   T script.py
  ↑↓ move  →← open  Enter zoom  ⌫ up  Del trash  v panes  r rescan  q quit       a: disk usage  t: by type  ?: keys
 ```
 
@@ -50,10 +50,12 @@ termdisk --summary [PATH]   scan PATH (default: the current folder) and print it
 ```
 
 The left pane is the folder tree (name, usage: the share of its folder as a percentage and a
-bar, size, items, last change), largest first. A click on a column heading sorts it by that
-column (Usage by size), a second click the other way round; `s` and `S` do the same from the
-keyboard. Names go A to Z (capitals and small letters together), sizes, item counts and
-changes largest or newest first, and the heading sorted by has an arrow. The right pane is a
+bar, size, items, last change), folders first, largest first. A click on a column heading
+sorts it by that column (Usage by size), a second click the other way round; `s` and `S` do
+the same from the keyboard. Folders stay on top either way. Names go A to Z (capitals and
+small letters together), sizes, item counts and changes largest or newest first, and the
+heading sorted by has an arrow. Each level of the tree has a guide line, and guides, chevrons
+and folder icons are coloured by level (gold, orchid, blue in turn). The right pane is a
 treemap of the folder that holds the selected row (on the shown folder's own row, of that
 folder), always largest first: moving down into an open folder shows that folder's map.
 Selecting in one pane selects in the other. Folders in the tree start closed.
@@ -135,16 +137,17 @@ seconds.
 
 ## Look
 
-termdisk looks like termcode: its default colours (VS Code's dark theme) and its three icon
-sets. The colours are fitted to what the terminal shows, from `COLORTERM` and `TERM`; set
-`TERMDISK_COLORS=truecolor`, `256` or `16` where that guess is wrong (tmux without true
-colour, some ssh sessions). The icons are a Nerd Font's when one is installed (asked of
-fontconfig as termcode does; Unicode over ssh); set `TERMDISK_ICONS=nerd`, `unicode` or
-`ascii`. A terminal that draws East Asian Ambiguous characters two cells wide (a CJK locale
-setting in some terminals) misplaces the Unicode set's arrows, bars and box lines: use
-`TERMDISK_ICONS=ascii` there. The selection, the lock on what cannot be trashed and the
-dialog's focus also show without colour: a mark at the row's edge, the selected tile's
-outline, a lock sign, bold and crossed-out buttons.
+termdisk looks like termcode: its default colours (VS Code's dark theme; the tree's levels
+in its bracket pair colours, gold, orchid and blue) and its three icon sets. The colours are
+fitted to what the terminal shows, from `COLORTERM` and `TERM`; set `TERMDISK_COLORS=truecolor`,
+`256` or `16` where that guess is wrong (tmux without true colour, some ssh sessions). The
+icons are a Nerd Font's when one is installed (asked of fontconfig as termcode does; Unicode
+over ssh); set `TERMDISK_ICONS=nerd`, `unicode` or `ascii`. A terminal that draws East Asian
+Ambiguous characters two cells wide (a CJK locale setting in some terminals) misplaces the
+Unicode set's arrows, bars, box lines and the tree's guides: use `TERMDISK_ICONS=ascii`
+there. The selection, the lock on what cannot be trashed and the dialog's focus also show
+without colour: a mark at the row's edge, the selected tile's outline, a lock sign, bold and
+crossed-out buttons; the tree's levels show by their indent and guides.
 
 ## Third-party
 

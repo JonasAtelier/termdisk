@@ -538,14 +538,16 @@ fn tree_pane(
         if selected {
             put(buf, r.x, y, g.mark, 1, style.fg(c.focus));
         }
-        // termcode's row: [indent][chevron][space][icon][space][name].
+        // termcode's row: [indent][chevron][space][icon][space][name]; each level of the indent
+        // is a guide and a space.
         let open = b.open.contains(&id) || id == b.zoom;
         let (chev, icon) = match (n.is_dir(), open) {
             (true, true) => (g.open, g.folder_open),
             (true, false) => (g.closed, g.folder),
             _ => (" ", g.file),
         };
-        let indent = "  ".repeat(depth.min(12) as usize);
+        let levels = depth.min(12);
+        let indent = format!("{} ", g.guide).repeat(levels as usize);
         let lead = format!("{indent}{chev} {}", icon_gap(icon));
         let mut name = name_of(b, id);
         if n.is_dir() && id != 0 {
@@ -563,13 +565,28 @@ fn tree_pane(
         };
         let full = format!("{lead}{name}{lock}{link}");
         let room = name_w.saturating_sub(2) as usize;
-        put(buf, r.x + 1, y, &fit_end(&full, room, g.cut), name_w, style);
+        let shown = fit_end(&full, room, g.cut);
+        put(buf, r.x + 1, y, &shown, name_w, style);
+        // Each level's colour on its guide, and on the chevron and folder icon of a row at that
+        // level (the selected row keeps its own); only as far as the text is shown, not over
+        // where it is cut.
         if !selected {
+            let cut = usize::from(width(&full) > room);
+            let end = r.x + 1 + width(&shown).saturating_sub(cut) as u16;
+            let mut paint = |x: u16, glyph: &str, fg: Color| {
+                if x < end {
+                    put(buf, x, y, glyph, 1, style.fg(fg));
+                }
+            };
+            let level = |d: u16| c.depth[usize::from(d) % c.depth.len()];
+            for d in 0..levels {
+                paint(r.x + 1 + 2 * d, g.guide, level(d));
+            }
             let x = r.x + 1 + width(&indent) as u16;
-            let st = style.fg(c.icon_fg);
-            put(buf, x, y, chev, 1, st);
+            let fg = if n.is_dir() { level(depth) } else { c.icon_fg };
+            paint(x, chev, fg);
             if !icon.is_empty() {
-                put(buf, x + 2, y, icon, 1, st);
+                paint(x + 2, icon, fg);
             }
         }
         if locked && width(&full) <= room {

@@ -891,8 +891,9 @@ impl Browse {
         }
     }
 
-    /// The children of `id` in the tree's order: `kids` sorted again, stably, so items equal in
-    /// the sorted column stay largest first.
+    /// The children of `id` in the tree's order: folders first, then the rest, each in the
+    /// sorted column's order; `kids` sorted again, stably, so items equal there stay largest
+    /// first.
     fn ordered(&mut self, id: NodeId) -> Vec<NodeId> {
         if let Some(kids) = self.ordered.get(&id) {
             return kids.clone();
@@ -907,11 +908,13 @@ impl Browse {
                 Field::Items => x.items.cmp(&y.items), // a file has none
                 Field::Modified => x.mtime.cmp(&y.mtime),
             };
-            if sort.descending {
+            let order = if sort.descending {
                 order.reverse()
             } else {
                 order
-            }
+            };
+            // Folders first, whichever way round the rest goes.
+            y.is_dir().cmp(&x.is_dir()).then(order)
         });
         self.ordered.insert(id, kids.clone());
         kids
@@ -2172,16 +2175,17 @@ mod tests {
         assert_eq!(browse(&mut v).sort, Sort::default());
         assert_eq!(order(&mut v), ["big", "linked", "small"], "largest first");
         select(&mut v, "linked");
-        // big holds 21 items, the files none: equal ones stay largest first.
+        // big, the one folder, comes first either way; the files hold no items, so they stay
+        // largest first by items.
         let steps = [
             ('s', Field::Items, true, ["big", "linked", "small"]),
-            ('S', Field::Items, false, ["linked", "small", "big"]),
-            ('s', Field::Modified, true, ["small", "big", "linked"]),
-            ('S', Field::Modified, false, ["linked", "big", "small"]),
+            ('S', Field::Items, false, ["big", "linked", "small"]),
+            ('s', Field::Modified, true, ["big", "small", "linked"]),
+            ('S', Field::Modified, false, ["big", "linked", "small"]),
             ('s', Field::Name, false, ["big", "linked", "small"]),
-            ('S', Field::Name, true, ["small", "linked", "big"]),
+            ('S', Field::Name, true, ["big", "small", "linked"]),
             ('s', Field::Size, true, ["big", "linked", "small"]),
-            ('S', Field::Size, false, ["small", "linked", "big"]),
+            ('S', Field::Size, false, ["big", "small", "linked"]),
         ];
         for (k, by, descending, rows) in steps {
             key(&mut v, KeyCode::Char(k));
@@ -2203,7 +2207,7 @@ mod tests {
         assert_eq!(browse(&mut v).sort, Sort::default().by(Field::Name));
         assert!(has(&text(&mut v, 120, 40), "Name▴"));
         click(&mut v, name.x + 1, name.y);
-        assert_eq!(order(&mut v), ["small", "linked", "big"]);
+        assert_eq!(order(&mut v), ["big", "small", "linked"]);
         assert!(has(&text(&mut v, 120, 40), "Name▾"));
         click(&mut v, usage.x + 1, usage.y);
         assert_eq!(browse(&mut v).sort, Sort::default());
@@ -2217,8 +2221,136 @@ mod tests {
         key(&mut v, KeyCode::Char('a'));
         assert_eq!(browse(&mut v).sort.by, Field::Name);
         key(&mut v, KeyCode::Char('S'));
-        assert_eq!(order(&mut v), ["small", "linked", "big"]);
+        assert_eq!(order(&mut v), ["big", "small", "linked"]);
         assert_eq!(tiles(&mut v, 120, 40).0, ["big", "linked", "small"]);
+    }
+
+    #[test]
+    fn folders_come_first_in_every_order_and_the_map_stays_by_size() {
+        let (_t, home) = home("view-folders-first");
+        let dir = home.join(".cache/mix");
+        for d in ["d_big", "D_small"] {
+            fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        fs::write(dir.join("d_big/x"), vec![0u8; 50_000]).unwrap();
+        fs::write(dir.join("D_small/x"), vec![0u8; 500]).unwrap();
+        fs::write(dir.join("D_small/y"), vec![0u8; 500]).unwrap();
+        fs::write(dir.join("f_big"), vec![0u8; 80_000]).unwrap();
+        fs::write(dir.join("F_small"), vec![0u8; 2000]).unwrap();
+        let times = [
+            ("d_big", 1_000),
+            ("D_small", 2_000),
+            ("f_big", 3_000),
+            ("F_small", 1_500),
+        ];
+        for (name, secs) in times {
+            let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+            fs::File::open(dir.join(name))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        }
+        let mut v = ready(policy(&home, None), &dir);
+        let (d, dd, f, ff) = ("d_big", "D_small", "f_big", "F_small");
+        assert_eq!(order(&mut v), [d, dd, f, ff], "size, largest first");
+        select(&mut v, ff);
+        // The folders hold 1 and 2 items, the files none (so they stay largest first).
+        let steps = [
+            ('s', Field::Items, true, [dd, d, f, ff]),
+            ('S', Field::Items, false, [d, dd, f, ff]),
+            ('s', Field::Modified, true, [dd, d, f, ff]),
+            ('S', Field::Modified, false, [d, dd, ff, f]),
+            ('s', Field::Name, false, [d, dd, f, ff]),
+            ('S', Field::Name, true, [dd, d, ff, f]),
+            ('s', Field::Size, true, [d, dd, f, ff]),
+            ('S', Field::Size, false, [dd, d, ff, f]),
+        ];
+        for (k, by, descending, rows) in steps {
+            key(&mut v, KeyCode::Char(k));
+            assert_eq!(browse(&mut v).sort, Sort { by, descending });
+            assert_eq!(order(&mut v), rows, "{by:?}, descending {descending}");
+            assert_eq!(selected_name(&mut v), ff, "selection kept");
+            assert_eq!(tiles(&mut v, 120, 40).0, [f, d, dd, ff], "the map: by size");
+        }
+    }
+
+    /// The line of the tree row named `name` in the last drawing.
+    fn row_y(v: &mut View, name: &str) -> u16 {
+        let rows = v.hits.rows;
+        let b = browse(v);
+        let i = b.rows.iter().position(|r| b.tree.name(r.0) == name);
+        rows.y + (i.unwrap() - b.top) as u16
+    }
+
+    #[test]
+    fn the_tree_colours_each_level_and_the_selected_row_keeps_its_own() {
+        let (_t, home) = home("view-levels");
+        let deep = home.join(".cache/big/inner/deep");
+        fs::create_dir(&deep).unwrap();
+        fs::write(deep.join("leaf"), b"x").unwrap();
+        for (set, guide, open) in [(IconSet::Unicode, "│", "▾"), (IconSet::Ascii, "|", "v")] {
+            let mut v = ready(policy(&home, None), &home.join(".cache"));
+            v.set_icons(set);
+            let c = v.colors;
+            let leaf = browse(&mut v).tree.find(&deep.join("leaf")).unwrap();
+            browse(&mut v).select(leaf); // opens big, inner and deep
+            select(&mut v, "linked"); // the selection away from the rows looked at
+            let buf = draw_buf(&mut v, 120, 40);
+            // Where names start.
+            let x = v.hits.rows.x + 1;
+            // The shown folder's row: no guide, its chevron in the first level's colour.
+            let top = v.hits.rows.y;
+            assert_eq!(buf[(x, top)].symbol(), open, "{set:?}");
+            assert_eq!(buf[(x, top)].fg, c.depth[0], "{set:?}");
+            for (name, depth) in [("big", 1), ("inner", 2), ("deep", 3), ("leaf", 4)] {
+                let y = row_y(&mut v, name);
+                for level in 0..depth {
+                    let cell = &buf[(x + 2 * level, y)];
+                    let at = format!("{set:?} {name}, level {level}");
+                    assert_eq!(cell.symbol(), guide, "{at}");
+                    assert_eq!(cell.fg, c.depth[usize::from(level) % 3], "{at}");
+                    assert_eq!(buf[(x + 2 * level + 1, y)].symbol(), " ", "{at}");
+                }
+                // A folder's chevron in its own level's colour; a file's icon as before.
+                let (at, fg) = match name {
+                    "leaf" => (x + 2 * depth + 2, c.icon_fg),
+                    _ => (x + 2 * depth, c.depth[usize::from(depth) % 3]),
+                };
+                if set == IconSet::Unicode || name != "leaf" {
+                    assert_eq!(buf[(at, y)].fg, fg, "{set:?} {name}");
+                }
+            }
+            // The selected row keeps its colours, guides and all.
+            browse(&mut v).select(leaf);
+            let buf = draw_buf(&mut v, 120, 40);
+            let y = row_y(&mut v, "leaf");
+            assert_eq!(buf[(x, y)].symbol(), guide);
+            for cell in (x..x + 12).map(|x| &buf[(x, y)]) {
+                assert_eq!((cell.fg, cell.bg), (c.sel_fg, c.sel_bg), "{set:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn colours_on_a_deep_row_stop_where_its_text_is_cut() {
+        let (_t, home) = home("view-levels-cut");
+        let mut dir = home.join(".cache");
+        for i in 0..10 {
+            dir = dir.join(format!("n{i}"));
+        }
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("leafz"), b"x").unwrap();
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        let leaf = browse(&mut v).tree.find(&dir.join("leafz")).unwrap();
+        browse(&mut v).select(leaf); // 11 levels deep: 22 cells of guides
+        key(&mut v, KeyCode::Up);
+        v.panes = Panes::Tree;
+        let buf = draw_buf(&mut v, 24, 30);
+        let (x, y) = (v.hits.rows.x + 1, row_y(&mut v, "leafz"));
+        // 21 cells for the text: 20 of it, then the cut mark, which no guide covers.
+        assert_eq!(buf[(x + 20, y)].symbol(), "…");
+        assert_eq!(buf[(x + 18, y)].symbol(), "│");
+        assert_eq!(buf[(x + 18, y)].fg, v.colors.depth[9 % 3]);
     }
 
     #[test]

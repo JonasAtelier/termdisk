@@ -43,6 +43,9 @@ pub struct Colors {
     /// The mark at the selected row's left edge, the selected tile (`focusBorder`).
     pub focus: Color,
     pub icon_fg: Color,
+    /// The tree's levels in turn: the indent guides, and the chevron and folder icon of a row
+    /// (`editorBracketHighlight.foreground1` to `3`).
+    pub depth: [Color; 3],
     /// The lock on what cannot be trashed (`editorWarning.foreground`).
     pub lock: Color,
     /// Usage bars: the filled part (`button.background`) and the rest (`titleBar.activeBackground`).
@@ -98,6 +101,7 @@ impl Default for Colors {
             sel_fg: rgb(0xFFFFFF),
             focus: rgb(0x007FD4),
             icon_fg: rgb(0xC5C5C5),
+            depth: [rgb(0xFFD700), rgb(0xDA70D6), rgb(0x179FFF)],
             lock: rgb(0xCCA700),
             bar: rgb(0x0E639C),
             bar_track: rgb(0x3C3C3C),
@@ -159,6 +163,7 @@ impl Colors {
             sel_fg: f(self.sel_fg),
             focus: f(self.focus),
             icon_fg: f(self.icon_fg),
+            depth: self.depth.map(f),
             lock: f(self.lock),
             bar: f(self.bar),
             bar_track: f(self.bar_track),
@@ -275,6 +280,8 @@ pub(crate) struct Glyphs {
     pub check: &'static str,
     /// After the heading the tree is sorted by: ascending, descending.
     pub sort: [&'static str; 2],
+    /// The first cell of each level of the tree's indent.
+    pub guide: &'static str,
 }
 
 const NERD: Glyphs = Glyphs {
@@ -307,6 +314,7 @@ const UNICODE: Glyphs = Glyphs {
     check: "✓",
     // Not ▲▼: those are two cells wide where East Asian ambiguous widths are wide.
     sort: ["▴", "▾"],
+    guide: "│",
 };
 
 const ASCII: Glyphs = Glyphs {
@@ -327,6 +335,7 @@ const ASCII: Glyphs = Glyphs {
     slider: "|",
     check: "+",
     sort: ["^", "v"],
+    guide: "|",
 };
 
 impl IconSet {
@@ -399,11 +408,24 @@ mod tests {
     }
 
     #[test]
+    fn neighbouring_levels_of_the_tree_differ_at_every_depth() {
+        for d in [Depth::True, Depth::C256, Depth::C16] {
+            let c = Colors::default().fitted(d).depth;
+            for i in 0..c.len() {
+                // The levels go round: the last one is next to the first.
+                assert_ne!(c[i], c[(i + 1) % c.len()], "{d:?}: {i}");
+            }
+        }
+        let c16 = Colors::default().fitted(Depth::C16).depth;
+        assert_eq!(c16, [Color::LightYellow, Color::Magenta, Color::Cyan]);
+    }
+
+    #[test]
     fn every_glyph_is_one_cell_or_none_and_ascii_is_ascii() {
         for set in [IconSet::Nerd, IconSet::Unicode, IconSet::Ascii] {
             let g = set.glyphs();
             let one = [
-                g.closed, g.open, g.lock, g.mark, g.cut, g.sep, g.dot, g.slider, g.check,
+                g.closed, g.open, g.lock, g.mark, g.cut, g.sep, g.dot, g.slider, g.check, g.guide,
             ];
             assert!(one.iter().chain(g.spin).all(|s| s.width() == 1), "{set:?}");
             let none_or_one = [g.folder, g.folder_open, g.file];
@@ -419,7 +441,7 @@ mod tests {
         }
         let a = IconSet::Ascii.glyphs();
         let all = [
-            a.closed, a.open, a.lock, a.mark, a.sep, a.dot, a.cut, a.slider, a.check,
+            a.closed, a.open, a.lock, a.mark, a.sep, a.dot, a.cut, a.slider, a.check, a.guide,
         ];
         assert!(all
             .iter()
