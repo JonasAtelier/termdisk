@@ -16,13 +16,16 @@
 #                 print how long it took (only for whole screens: a redraw writes changed
 #                 cells, so text that replaces other text may come in pieces)
 #   waitout       wait (60 s at most) for any output after the last mark; print how long
+#   bytes         print how many bytes it wrote since the last mark (0: nothing redrawn)
+#   count:TEXT    print how often TEXT is in all its output
+#   palette       print how many true colours it used and which indexed ones (0-15: the 16)
 #   threads       print its thread count
 #   ctx:S         print its voluntary context switches (wake-ups) over S seconds
 #   winsize:C;R   resize the terminal to C columns, R rows
 #   signal:NAME   send it a signal (TERM, INT, HUP)
 # At the end it waits for termdisk to exit (40 s at most) and prints the exit code, its max RSS,
 # whether the terminal was put back, and what the temporary trash holds; then removes it all.
-import fcntl, os, shutil, signal, struct, subprocess, sys, tempfile, termios, threading, time
+import fcntl, os, re, shutil, signal, struct, subprocess, sys, tempfile, termios, threading, time
 
 args = sys.argv[1:]
 read_only = '--read-only' in args
@@ -112,6 +115,13 @@ for st in steps:
         while len(out) == since and time.time() - clock < 60:
             time.sleep(0.001)
         print(f'first output after the mark: {time.time() - clock:.3f} s')
+    elif k == 'bytes':
+        print(f'bytes out since the mark: {len(out) - since}')
+    elif k == 'count':
+        print(f'count {v!r}: {out.count(v.encode())}')
+    elif k == 'palette':
+        idx = {int(n) for n in re.findall(rb'[34]8;5;(\d+)', out)}
+        print(f'palette: {len(re.findall(rb"[34]8;2;", out))} true colours, indexed {sorted(idx)}')
     elif k == 'threads':
         print(f'threads: {len(os.listdir(f"/proc/{p.pid}/task"))}')
     elif k == 'ctx':
