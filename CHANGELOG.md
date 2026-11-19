@@ -2,7 +2,7 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-11-19
 
 ### Changed
 - The tree: a double click on a folder opens it where it is, its contents indented under it;
@@ -27,7 +27,7 @@ What changed in each termdisk release, newest first. The version rule is in `AGE
   check mark, until the next key or click.
 - An `fc-list` that hangs is killed after 2 s, or when termdisk ends.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-11-18 (not tagged)
 
 ### Added
 - `termdisk [PATH]`: the view. Without PATH a start screen offers home, the cache, /tmp and
