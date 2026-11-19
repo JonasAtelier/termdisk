@@ -150,4 +150,4 @@ changed in each version.
 
 ## License
 
-MIT, see `LICENSE`.
+© 2026 JonasAtelier, GPL-3.0-only, see `LICENSE`.

@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.93"
 description = "A disk usage analyzer with a treemap, in the terminal"
 repository = "https://github.com/JonasAtelier/termdisk"
-license = "MIT"
+license = "GPL-3.0-only"
 
 [dependencies]
 # The system calls (sys.rs, trash.rs), getpwuid_r, statvfs, localtime_r, signal masks.
