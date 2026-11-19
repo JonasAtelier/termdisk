@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
 # Drives termdisk in a pty (120x40) with its own temporary HOME, XDG folders and a fixture, and
 # reports what a person cannot see from outside.
 #

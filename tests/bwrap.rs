@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! `termdisk --summary` on real mounts, made inside a bwrap sandbox (a user and mount
 //! namespace: nothing outside it changes): a tmpfs, and a bind mount of a folder from the same
 //! filesystem, under a root given as a relative path. Skipped where bwrap cannot run.

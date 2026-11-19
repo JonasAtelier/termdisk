@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Drawing the view into a ratatui `Buffer`: cells, colours and text, nothing else.
 
 use std::ffi::OsStr;

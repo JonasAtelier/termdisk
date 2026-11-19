@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The scan: a few threads walk the folders, one thread builds the tree.
 //!
 //! Walkers take folders from a shared stack, read each one and send its entries to the

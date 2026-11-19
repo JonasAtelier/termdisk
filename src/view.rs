@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The embeddable view: what is on screen and what keys and clicks do to it. It draws into a
 //! ratatui `Buffer` (draw.rs) and takes crossterm events, both only as data: the terminal itself
 //! belongs to the host (the CLI in main.rs, or termcode).

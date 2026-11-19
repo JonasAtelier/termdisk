@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The Linux calls the scan and the trash guard share: folders opened as file descriptors
 //! (never through a symlink), listed with `getdents64`, and entries lstat'ed with `statx`
 //! relative to them. The calls go through `libc::syscall`, so a static musl build (as

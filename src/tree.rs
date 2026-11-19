@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The scan result: every file and folder under the scan root, in one arena.
 //!
 //! A folder's children sit next to each other in `nodes` (the scanner adds a whole folder at

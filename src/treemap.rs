@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! A squarified treemap (Bruls, Huizing and van Wijk, 2000) laid out in terminal cells.
 //!
 //! Rows of tiles are laid along the shorter side of the space left, each row taking items for

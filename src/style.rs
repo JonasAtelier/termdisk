@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The look: the colours (termcode's defaults, which are VS Code's dark theme) and the glyphs
 //! of the three icon sets termcode has. Both are plain data a host replaces with its own
 //! (`View::set_colors`, `View::set_icons`).

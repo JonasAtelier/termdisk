@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! termdisk: a disk usage analyzer for the terminal. The library scans a folder into a compact
 //! tree and shows it in a `View` drawn into a ratatui `Buffer`; it has no terminal code, so a
 //! host such as termcode can embed it.

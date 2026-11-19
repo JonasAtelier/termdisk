@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-only
 # Speed and memory of a scan, against du and ncdu, to compare a change with what came before.
 # Usage: scripts/bench.sh [BINARY] [DIR]   (defaults: target/release/termdisk, $HOME;
 #        build it first with `cargo build -j4 --release`)

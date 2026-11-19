@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! How long a frame takes on a real tree: the treemap layout alone and the whole view drawn
 //! into a buffer, at 120x40 and 300x80. Read-only; prints medians of 50.
 //! `cargo run --release --example frame -- PATH` (scripts/bench.sh runs it).

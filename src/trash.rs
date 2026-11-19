@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The freedesktop.org trash, the home one only (`$XDG_DATA_HOME/Trash`): an item moved there
 //! can be put back from the file manager. The item is renamed in, so it must be on the trash's
 //! filesystem; it is never copied, and nothing of it is ever deleted. Only `guard::trash` gets

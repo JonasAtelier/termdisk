@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The termdisk CLI: the view in the terminal, or `--summary`. All terminal code lives here.
 
 use std::io::{self, Read, Write};

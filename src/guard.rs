@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The one way termdisk removes anything: `trash`, which moves one item to the home trash.
 //! Before it does, it checks on the disk itself, at that moment, never trusting the scan:
 //!
