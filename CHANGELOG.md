@@ -2,7 +2,7 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-11-19
 
 ### Added
 - A red cross at the right of the title bar, on every screen: a click on it does what `q`
