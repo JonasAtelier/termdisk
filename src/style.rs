@@ -76,6 +76,12 @@ pub struct Colors {
     pub button_hover: Color,
     pub button2_hover: Color,
     pub status_hover: Color,
+    /// The close button at the right of the title bar: its cross, and its background under
+    /// the pointer (white cross there, `button_fg`).
+    pub close_fg: Color,
+    pub close_hover: Color,
+    /// The faint lines between the tree's columns.
+    pub column_line: Color,
     /// The tree's scrollbar (`scrollbarSlider.background`, opaque: it is drawn as a glyph).
     pub slider: Color,
 }
@@ -101,7 +107,8 @@ impl Default for Colors {
             sel_fg: rgb(0xFFFFFF),
             focus: rgb(0x007FD4),
             icon_fg: rgb(0xC5C5C5),
-            depth: [rgb(0xFFD700), rgb(0xDA70D6), rgb(0x179FFF)],
+            // Soft gold, orchid and steel blue (xterm's 179, 139, 67).
+            depth: [rgb(0xD7AF5F), rgb(0xAF87AF), rgb(0x5F87AF)],
             lock: rgb(0xCCA700),
             bar: rgb(0x0E639C),
             bar_track: rgb(0x3C3C3C),
@@ -113,18 +120,18 @@ impl Default for Colors {
             button2_bg: rgb(0x2A2D2E),
             button2_fg: rgb(0xCCCCCC),
             disabled: rgb(0x797979), // foreground at 0.5 over the widget
-            // From xterm's 256 colours, muted enough for white text. Blue is in none (nor
-            // violet), so the selected tile is the only blue one; neighbours differ in 16
-            // colours too (red, green, red, grey, cyan, red, green, magenta).
+            // Soft, earthy colours from xterm's 256 (131, 65, 137, 66, 96, 101, 95, 132), dark
+            // enough for white text. Blue is in none, so the selected tile is the only blue
+            // one; in 16 colours they keep their hue (`vivid16`) and neighbours still differ.
             tiles: [
-                rgb(0x87005F),
-                rgb(0x00875F),
-                rgb(0x870000),
+                rgb(0xAF5F5F),
+                rgb(0x5F875F),
+                rgb(0xAF875F),
+                rgb(0x5F8787),
+                rgb(0x875F87),
+                rgb(0x87875F),
                 rgb(0x875F5F),
-                rgb(0x008787),
-                rgb(0xAF5F00),
-                rgb(0x5F8700),
-                rgb(0x870087),
+                rgb(0xAF5F87),
             ],
             sel_tile: rgb(0x005FD7), // xterm's 26: blue in 16 colours too
             tile_fg: rgb(0xFFFFFF),
@@ -134,7 +141,10 @@ impl Default for Colors {
             button_hover: rgb(0x1177BB),
             button2_hover: rgb(0x45494E),
             status_hover: rgb(0x1F8AD2), // white at 0.12 over the status bar
+            column_line: rgb(0x464647),  // as widget_border
             slider: rgb(0x797979),
+            close_fg: rgb(0xF14C4C), // errorForeground
+            close_hover: rgb(0xE81123),
         }
     }
 }
@@ -147,6 +157,11 @@ impl Colors {
             (Color::Rgb(r, g, b), Depth::C256) => Color::Indexed(to256(r, g, b)),
             (Color::Rgb(r, g, b), Depth::C16) => to16(r, g, b),
             (c, _) => c,
+        };
+        // Soft colours that only tell things apart: in 16 colours keep their hue, not grey.
+        let v = |c: Color| match (c, d) {
+            (Color::Rgb(r, g, b), Depth::C16) => vivid16(r, g, b),
+            _ => f(c),
         };
         Colors {
             bg: f(self.bg),
@@ -163,7 +178,7 @@ impl Colors {
             sel_fg: f(self.sel_fg),
             focus: f(self.focus),
             icon_fg: f(self.icon_fg),
-            depth: self.depth.map(f),
+            depth: self.depth.map(v),
             lock: f(self.lock),
             bar: f(self.bar),
             bar_track: f(self.bar_track),
@@ -175,7 +190,7 @@ impl Colors {
             button2_bg: f(self.button2_bg),
             button2_fg: f(self.button2_fg),
             disabled: f(self.disabled),
-            tiles: self.tiles.map(f),
+            tiles: self.tiles.map(v),
             sel_tile: f(self.sel_tile),
             tile_fg: f(self.tile_fg),
             rest_bg: f(self.rest_bg),
@@ -184,7 +199,10 @@ impl Colors {
             button_hover: f(self.button_hover),
             button2_hover: f(self.button2_hover),
             status_hover: f(self.status_hover),
+            column_line: f(self.column_line),
             slider: f(self.slider),
+            close_fg: f(self.close_fg),
+            close_hover: f(self.close_hover),
         }
     }
 }
@@ -241,6 +259,17 @@ fn to16(r: u8, g: u8, b: u8) -> Color {
         .1
 }
 
+/// The nearest of the 16 basic colours to `(r, g, b)` at full strength, so a muted colour keeps
+/// its hue instead of turning grey; a grey stays grey.
+fn vivid16(r: u8, g: u8, b: u8) -> Color {
+    let (lo, hi) = (r.min(g).min(b), r.max(g).max(b));
+    if hi - lo < 16 {
+        return to16(r, g, b);
+    }
+    let full = |v: u8| ((v - lo) as u32 * 255 / (hi - lo) as u32) as u8;
+    to16(full(r), full(g), full(b))
+}
+
 /// The glyphs termdisk draws with, as termcode's icon sets have them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IconSet {
@@ -282,6 +311,8 @@ pub(crate) struct Glyphs {
     pub sort: [&'static str; 2],
     /// The first cell of each level of the tree's indent.
     pub guide: &'static str,
+    /// The close button's cross.
+    pub close: &'static str,
 }
 
 const NERD: Glyphs = Glyphs {
@@ -315,6 +346,7 @@ const UNICODE: Glyphs = Glyphs {
     // Not ▲▼: those are two cells wide where East Asian ambiguous widths are wide.
     sort: ["▴", "▾"],
     guide: "│",
+    close: "✕", // not ×: that one is East Asian ambiguous
 };
 
 const ASCII: Glyphs = Glyphs {
@@ -336,6 +368,7 @@ const ASCII: Glyphs = Glyphs {
     check: "+",
     sort: ["^", "v"],
     guide: "|",
+    close: "x",
 };
 
 impl IconSet {
@@ -395,6 +428,10 @@ mod tests {
             Colors::default().fitted(Depth::C16),
         );
         assert_eq!(c256.sel_tile, Color::Indexed(26));
+        let soft: Vec<Color> = [131, 65, 137, 66, 96, 101, 95, 132]
+            .map(Color::Indexed)
+            .into();
+        assert_eq!(c256.tiles.to_vec(), soft);
         assert_eq!(c16.sel_tile, Color::Blue);
         let blue = [Color::Blue, Color::LightBlue];
         assert!(!c16.tiles.iter().any(|t| blue.contains(t)));
@@ -417,7 +454,9 @@ mod tests {
             }
         }
         let c16 = Colors::default().fitted(Depth::C16).depth;
-        assert_eq!(c16, [Color::LightYellow, Color::Magenta, Color::Cyan]);
+        assert_eq!(c16, [Color::Yellow, Color::LightMagenta, Color::Cyan]);
+        let c256 = Colors::default().fitted(Depth::C256).depth;
+        assert_eq!(c256, [179, 139, 67].map(Color::Indexed));
     }
 
     #[test]
@@ -426,6 +465,7 @@ mod tests {
             let g = set.glyphs();
             let one = [
                 g.closed, g.open, g.lock, g.mark, g.cut, g.sep, g.dot, g.slider, g.check, g.guide,
+                g.close,
             ];
             assert!(one.iter().chain(g.spin).all(|s| s.width() == 1), "{set:?}");
             let none_or_one = [g.folder, g.folder_open, g.file];

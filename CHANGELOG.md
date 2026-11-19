@@ -4,26 +4,34 @@ What changed in each termdisk release, newest first. The version rule is in `AGE
 
 ## [0.3.0] - Unreleased
 
+### Added
+- A red cross at the right of the title bar, on every screen: a click on it does what `q`
+  does (quits; nothing under the trash dialog). Under the pointer it turns red. Library:
+  `Colors::close_fg`, `Colors::close_hover`.
+
 ### Changed
 - The tree sorts by name, size, items or last change, either way round: a click on a column
   heading (Usage sorts by size; again: the other way), or `s` (the next column) and `S` (the
   other way). Names go A to Z with capitals and small letters together; the other columns
   start largest or newest first. The heading sorted by has an arrow. The default is still
   size, largest first, and the selection stays on its item.
+- The tree's columns are parted by faint lines (`Colors::column_line`), and a heading under the
+  pointer underlines its text only, the same for every column.
 - In the tree, folders come first in every folder, then the files and the rest, each in the
   sorted order (turning the order round keeps the folders on top).
 - The tree's levels have colours: each level of the indent has a guide line (`│`, or `|` in
-  ASCII), and the guides, chevrons and folder icons take VS Code's bracket pair colours by
-  level in turn (gold, orchid, blue; fitted to 256 and 16 colours, neighbouring levels
+  ASCII), and the guides, chevrons and folder icons take soft colours by
+  level in turn (gold, orchid, steel blue; fitted to 256 and 16 colours, neighbouring levels
   differing). The selected row keeps its own colours. Library: `Colors::depth`.
 - The Usage column shows the share of its folder as a percentage before the bar ("41%";
   "<1%" below half a percent, ">99%" for nearly all, "100%" only for all); the bar is 8 cells.
   A narrow tree keeps the column it is sorted by.
 - The map follows the selection: it shows the folder that holds the selected row, that row's
-  tile selected; on an open folder's row (the shown folder's too), that folder's items. Its
+  tile selected, open folder or not; on the shown folder's own row, that folder. Every tile
+  with room is framed (the selected one in white, with the mark in its corner). Its
   legend starts with that folder's name. The map stays largest first whatever the tree's order.
-- The map's tiles take 8 colours in turn, so neighbouring tiles differ, and only the selected
-  tile is blue, also in 256 and 16 colours (the "+N items" tile when the selected item is among
+- The map's tiles take 8 soft colours in turn (in 16 colours they keep their hue), so
+  neighbouring tiles differ, and only the selected tile is blue, also in 256 and 16 colours (the "+N items" tile when the selected item is among
   them). The tiles keep their type or age letters (`t` now switches only those), and the
   legend lists the letters without colours.
 - Library: `Colors::kinds` and `Colors::ages` are replaced by `Colors::tiles` and

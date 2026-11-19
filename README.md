@@ -55,9 +55,11 @@ sorts it by that column (Usage by size), a second click the other way round; `s`
 the same from the keyboard. Folders stay on top either way. Names go A to Z (capitals and
 small letters together), sizes, item counts and changes largest or newest first, and the
 heading sorted by has an arrow. Each level of the tree has a guide line, and guides, chevrons
-and folder icons are coloured by level (gold, orchid, blue in turn). The right pane is a
-treemap of the folder that holds the selected row, that row's tile in blue; on an open
-folder's row (the shown folder's too), of that folder itself. Always largest first.
+and folder icons are coloured by level (soft gold, orchid, steel blue in turn). The right pane is a
+treemap of the folder that holds the selected row, that row's tile in blue (a folder, open
+or not, is shown among its neighbours; its items show once a row inside it is selected); on
+the shown folder's own row, of that folder. Always largest first. Every tile with room has a
+frame, the selected one a white frame and the mark in its corner.
 Selecting in one pane selects in the other. Folders in the tree start closed.
 
 | Key | |
@@ -77,7 +79,7 @@ Selecting in one pane selects in the other. Folders in the tree start closed.
 | v | tree and map / tree / map |
 | r | scan again |
 | ? | all the keys |
-| q | quit |
+| q, click on the red ✕ at the top right | quit |
 
 In the dialog for Del, Cancel has the focus, so Enter alone cancels; Tab (or an arrow) and
 Enter, or a click, moves the item. For half a second after the dialog opens, only Cancel
@@ -86,7 +88,7 @@ why. After a move the status bar says what went and how big it was until the nex
 click, which also does what it always does.
 
 The map's tiles take 8 colours in turn, so neighbouring tiles differ, and only the selected
-tile is blue (it also has an outline). Each tile starts with its class letter, by type (from
+tile is blue (with a white frame and the mark in its corner). Each tile starts with its class letter, by type (from
 the name only) or, with `t`, by the age of the last change, explained in the legend above the
 map after the name of the folder it shows (`/` folder, `V` video, `I` image, `A` audio, `Z`
 archive, `D` document, `T` code and text, `O` other; `W` this week, `M` this month, `Y` this
@@ -133,12 +135,12 @@ seconds.
   is a tmpfs, other disks).
 - Caches kept under `~/.config`, `~/.local` and `~/.var` (Electron and Flatpak programs) are
   inside protected folders and cannot be moved.
-- The treemap shows one level: the open folder selected, else the folder of the selected row.
+- The treemap shows one level: the folder that holds the selected row.
 
 ## Look
 
 termdisk looks like termcode: its default colours (VS Code's dark theme; the tree's levels
-in its bracket pair colours, gold, orchid and blue) and its three icon sets. The colours are
+in soft gold, orchid and steel blue, the map's tiles in soft earthy colours) and its three icon sets. The colours are
 fitted to what the terminal shows, from `COLORTERM` and `TERM`; set `TERMDISK_COLORS=truecolor`,
 `256` or `16` where that guess is wrong (tmux without true colour, some ssh sessions). The
 icons are a Nerd Font's when one is installed (asked of fontconfig as termcode does; Unicode
@@ -146,7 +148,7 @@ over ssh); set `TERMDISK_ICONS=nerd`, `unicode` or `ascii`. A terminal that draw
 Ambiguous characters two cells wide (a CJK locale setting in some terminals) misplaces the
 Unicode set's arrows, bars, box lines and the tree's guides: use `TERMDISK_ICONS=ascii`
 there. The selection, the lock on what cannot be trashed and the dialog's focus also show
-without colour: a mark at the row's edge, the selected tile's outline, a lock sign, bold and
+without colour: a mark at the row's edge, the mark in the selected tile's corner, a lock sign, bold and
 crossed-out buttons; the tree's levels show by their indent and guides.
 
 ## Third-party

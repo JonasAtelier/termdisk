@@ -143,6 +143,8 @@ pub(crate) enum Hover {
     Head(usize),
     Cancel,
     Move,
+    /// The close button.
+    Close,
 }
 
 pub(crate) enum Screen {
@@ -252,6 +254,8 @@ pub(crate) struct Hits {
     pub items: Vec<(Rect, char)>,
     /// The tree's column headings, and what a click on one sorts by.
     pub heads: Vec<(Rect, Field)>,
+    /// The close button at the right of the title bar: a click on it presses `q`.
+    pub close: Option<Rect>,
 }
 
 impl View {
@@ -655,6 +659,10 @@ impl View {
             self.help = false;
             return Outcome::Redraw;
         }
+        if self.hits.close.is_some_and(inside) {
+            // Whatever `q` does here: quit, or nothing under the dialog.
+            return self.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        }
         self.message = None;
         self.done = false;
         let item = self.hits.items.iter().find(|i| inside(i.0)).map(|i| i.1);
@@ -729,6 +737,11 @@ impl View {
         Outcome::Redraw
     }
 
+    /// The close button does something (what `q` does): everywhere but under the dialog.
+    pub(crate) fn close_works(&self) -> bool {
+        !matches!(&self.screen, Screen::Browse(b) if b.confirm.is_some())
+    }
+
     /// What is under (x, y) in the last drawing, for hover: the same places, in the same order,
     /// as a click looks for them in `handle_mouse`.
     pub(crate) fn hover_at(&self, x: u16, y: u16) -> Hover {
@@ -736,6 +749,9 @@ impl View {
         let h = &self.hits;
         if self.help {
             return Hover::Nothing;
+        }
+        if h.close.is_some_and(inside) && self.close_works() {
+            return Hover::Close;
         }
         match &self.screen {
             Screen::Start(s) if inside(h.places) => match usize::from(y - h.places.y) {
@@ -882,13 +898,10 @@ impl Browse {
     }
 
     /// The treemap's folder and its selected tile: the folder that holds the selected row, and
-    /// that row's item; on an open folder's row (the shown folder's too), that folder and no
-    /// tile, so opening a folder shows what is in it.
+    /// that row's item, open or closed (a folder is seen among the ones beside it); on the
+    /// shown folder's own row, that folder and no tile.
     pub fn map_of(&self) -> (NodeId, Option<NodeId>) {
         let sel = self.rows[self.cursor].0;
-        if self.open.contains(&sel) {
-            return (sel, None);
-        }
         match self.tree.parent(sel).filter(|_| sel != self.zoom) {
             Some(p) => (p, Some(sel)),
             None => (self.zoom, None),
@@ -1553,7 +1566,23 @@ mod tests {
             let b = browse(&mut v);
             let big = b.rows[b.cursor].0;
             let tile = v.hits.tiles.iter().find(|t| t.1 == Some(big)).unwrap().0;
-            assert_eq!(buf[(tile.x, tile.y)].symbol(), "╭", "the outline");
+            assert_eq!(
+                buf[(tile.x, tile.y)].symbol(),
+                "▌",
+                "the selected tile's mark"
+            );
+            // The frame's right edge is left of the gap column.
+            assert_eq!(buf[(tile.right() - 2, tile.y)].symbol(), "╮", "the outline");
+            // The other tiles are framed too.
+            let small = browse(&mut v).tree.find(&cache.join("small")).unwrap();
+            let other = v.hits.tiles.iter().find(|t| t.1 == Some(small)).unwrap().0;
+            if other.width >= 5 && other.height >= 4 {
+                assert_eq!(
+                    buf[(other.x, other.y)].symbol(),
+                    "╭",
+                    "every tile is framed"
+                );
+            }
             for (x, y) in (tile.x..tile.right())
                 .flat_map(|x| [(x, tile.y), (x, tile.bottom() - 1)])
                 .chain((tile.y..tile.bottom()).flat_map(|y| [(tile.x, y), (tile.right() - 1, y)]))
@@ -1942,17 +1971,13 @@ mod tests {
         assert_eq!(selected_name(&mut v), "big");
         assert_eq!(
             browse(&mut v).map_of(),
-            (big, None),
-            "an open folder maps its own items"
+            (0, Some(big)),
+            "open, still among its neighbours"
         );
         click(&mut v, x, y);
         click(&mut v, x, y);
         assert!(!browse(&mut v).open.contains(&big) && !row_shown(&mut v, "inner"));
-        assert_eq!(
-            browse(&mut v).map_of(),
-            (0, Some(big)),
-            "closed, the folder above again"
-        );
+        assert_eq!(browse(&mut v).map_of(), (0, Some(big)), "closed, the same");
         assert_eq!(selected_name(&mut v), "big");
         // Enter still shows that folder, Backspace the one above.
         key(&mut v, KeyCode::Enter);
@@ -1961,13 +1986,83 @@ mod tests {
         key(&mut v, KeyCode::Backspace);
         assert_eq!(browse(&mut v).zoom, 0);
         assert_eq!(selected_name(&mut v), "big");
-        // A double click on a tile still shows that folder (big closed, so it is a tile).
-        key(&mut v, KeyCode::Left);
+        // A double click on a tile still shows that folder.
         text(&mut v, 120, 40);
         let tile = v.hits.tiles.iter().find(|t| t.1 == Some(big)).unwrap().0;
         click(&mut v, tile.x, tile.y);
         click(&mut v, tile.x, tile.y);
         assert_eq!(browse(&mut v).zoom, big);
+    }
+
+    #[test]
+    fn headings_underline_their_text_only_and_faint_lines_part_the_columns() {
+        use ratatui::style::Modifier;
+        let (_t, home) = home("view-heads");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        draw_buf(&mut v, 120, 40);
+        let heads = v.hits.heads.clone();
+        for (at, _) in &heads {
+            v.pointer = Some((at.x, at.y));
+            let buf = draw_buf(&mut v, 120, 40);
+            let under: Vec<bool> = (at.x..at.right())
+                .map(|x| buf[(x, at.y)].modifier.contains(Modifier::UNDERLINED))
+                .collect();
+            let text: Vec<bool> = (at.x..at.right())
+                .map(|x| buf[(x, at.y)].symbol() != " ")
+                .collect();
+            assert_eq!(under, text, "only the text is underlined at {at:?}");
+        }
+        v.pointer = None;
+        let buf = draw_buf(&mut v, 120, 40);
+        let row = v.hits.rows.y;
+        for (at, _) in &heads[1..] {
+            for y in [at.y, row] {
+                let cell = &buf[(at.x - 1, y)];
+                assert_eq!(
+                    (cell.symbol(), cell.fg),
+                    ("│", v.colors.column_line),
+                    "{at:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_red_cross_quits_as_q_does_and_not_under_the_dialog() {
+        let (_t, home) = home("view-close");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        let buf = draw_buf(&mut v, 120, 40);
+        let close = v.hits.close.unwrap();
+        assert_eq!(
+            (close.x, close.y, close.width),
+            (117, 0, 3),
+            "the last 3 cells of the top"
+        );
+        assert_eq!(buf[(close.x + 1, close.y)].symbol(), "✕");
+        assert_eq!(buf[(close.x + 1, close.y)].fg, v.colors.close_fg);
+        assert_eq!(v.hover_at(close.x + 1, 0), Hover::Close);
+        v.pointer = Some((close.x + 1, 0));
+        let buf = draw_buf(&mut v, 120, 40);
+        assert_eq!(
+            buf[(close.x + 1, 0)].bg,
+            v.colors.close_hover,
+            "red under the pointer"
+        );
+        // Under the dialog `q` does nothing, and so does the cross.
+        key(&mut v, KeyCode::Delete);
+        assert!(browse(&mut v).confirm.is_some());
+        draw_buf(&mut v, 120, 40);
+        assert_eq!(v.hover_at(close.x + 1, 0), Hover::Nothing);
+        assert_eq!(click(&mut v, close.x + 1, 0), Outcome::None);
+        assert!(browse(&mut v).confirm.is_some(), "the dialog stays");
+        key(&mut v, KeyCode::Esc);
+        draw_buf(&mut v, 120, 40);
+        assert_eq!(click(&mut v, close.x, 0), Outcome::Quit);
+        // The start screen has it too.
+        let mut v = View::new(policy(&home, None), None);
+        draw_buf(&mut v, 80, 24);
+        let close = v.hits.close.unwrap();
+        assert_eq!(click(&mut v, close.x + 2, 0), Outcome::Quit);
     }
 
     #[test]

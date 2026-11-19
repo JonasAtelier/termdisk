@@ -220,9 +220,24 @@ fn paint(v: &mut View, area: Rect, buf: &mut Buffer) {
     // termcode's title bar: the text in the middle.
     let st = Style::new().bg(c.title_bg).fg(c.title_fg);
     buf.set_style(Rect::new(area.x, area.y, area.width, 1), st);
-    let t = fit_end(&title, area.width.saturating_sub(2) as usize, g.cut);
+    // The close button takes the last 3 cells; the title keeps clear of it on both sides.
+    let t = fit_end(&title, area.width.saturating_sub(8) as usize, g.cut);
     let x = area.x + (area.width - width(&t) as u16) / 2;
     put(buf, x, area.y, &t, area.width, st);
+    let close = Rect::new(area.right() - 3, area.y, 3, 1);
+    let cross = match look.over(close) && v.close_works() {
+        true => Style::new().bg(c.close_hover).fg(c.button_fg),
+        false => st.fg(c.close_fg),
+    };
+    put(
+        buf,
+        close.x,
+        close.y,
+        &format!(" {} ", g.close),
+        3,
+        cross.add_modifier(Modifier::BOLD),
+    );
+    hits.close = Some(close);
     let dot = g.dot;
     let line = match (&v.message, v.policy.read_only()) {
         (Some(m), _) if v.done => format!(" {} {}", g.check, clean(m)),
@@ -485,15 +500,22 @@ fn tree_pane(
             true => g.sort[usize::from(sort.descending)],
             false => "",
         };
-        let t = match right_aligned {
-            true => format!("{:>w$}", format!("{title}{arrow}"), w = at.width as usize),
-            false => format!("{title}{arrow}"),
+        // Hover underlines the heading's text only, the same for every column.
+        let t = format!("{title}{arrow}");
+        let x = match right_aligned {
+            true => at.x + at.width.saturating_sub(width(&t) as u16),
+            false => at.x,
         };
         let st = match look.over(at) {
             true => head.add_modifier(Modifier::UNDERLINED),
             false => head,
         };
-        put(buf, at.x, at.y, &t, at.width, st);
+        put(buf, x, at.y, &t, at.right() - x, st);
+        // A faint line in the space before each column after the name.
+        if right_aligned {
+            let line = Style::new().bg(c.header_bg).fg(c.column_line);
+            put(buf, at.x - 1, at.y, g.border[5], 1, line);
+        }
         hits.heads.push((at, field(title)));
     };
     let name_at = Rect::new(r.x + 1, r.y, name_w.saturating_sub(1), 1);
@@ -601,6 +623,7 @@ fn tree_pane(
         let mut x = r.x + name_w;
         let quiet = if selected { style } else { style.fg(c.dim) };
         for (title, w) in &cols {
+            put(buf, x, y, g.border[5], 1, style.fg(c.column_line));
             match *title {
                 "Usage" => {
                     let total = parent.map_or(counted(n, apparent), |p| counted(&p, apparent));
@@ -663,9 +686,9 @@ fn slider(track: u16, total: usize, view: usize, off: usize, max_off: usize) -> 
 /// The treemap of the folder that holds the selected row (of the shown folder on its own row),
 /// largest first, under a legend: that folder's name and the classes on the map. The selected
 /// item's tile is blue, every other one in the next colour of `Colors::tiles` (`modes`: apparent
-/// sizes, the letters by age). Every tile shows its class as a letter too, and the selected one
-/// an outline (or the mark where it is too small for one): both inside the tile, so a click on
-/// them picks that tile.
+/// sizes, the letters by age). Every tile shows its class as a letter too and has a frame where
+/// it has room (white on the selected one, which also has the mark in its corner): all inside
+/// the tile, so a click on them picks that tile.
 fn map_pane(
     b: &mut Browse,
     (apparent, by_age): (bool, bool),
@@ -739,9 +762,11 @@ fn map_pane(
             (false, Item::Rest(_)) => Style::new().bg(c.rest_bg).fg(c.rest_fg),
         };
         buf.set_style(fill, style);
-        let outlined = chosen && fill.width >= 4 && fill.height >= 3;
+        // Every tile has a frame where it has room: dark on the others, white on the selected.
+        let outlined = fill.width >= 4 && fill.height >= 3;
         if outlined {
-            outline(fill, style, look, buf);
+            let edge = if chosen { style } else { style.fg(c.bg) };
+            outline(fill, edge, look, buf);
         }
         let w = fill.width.saturating_sub(1 + u16::from(outlined));
         let top = match look.over(rect) && !chosen {
@@ -762,7 +787,7 @@ fn map_pane(
         if fill.height > 1 {
             put(buf, fill.x + 1, fill.y + 1, &detail, w, style);
         }
-        if chosen && !outlined {
+        if chosen {
             put(buf, fill.x, fill.y, g.mark, 1, style); // the selected tile, without colour
         }
         hits.tiles.push((rect, id));
