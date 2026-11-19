@@ -28,6 +28,12 @@ caches and temporary files.
 ## Install
 
 ```
+cargo install termdisk
+```
+
+Or the latest from the repository:
+
+```
 cargo install --git https://github.com/JonasAtelier/termdisk --locked
 ```
 

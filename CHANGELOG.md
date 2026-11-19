@@ -2,7 +2,7 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
-## [0.2.1] - Unreleased
+## [0.2.1] - 2026-11-19
 
 ### Changed
 - The licence: from this version termdisk is GPL-3.0-only (0.2.0 and earlier: MIT).
