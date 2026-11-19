@@ -1,0 +1,106 @@
+# The checks: on pushes to main, on pull requests, and as the first job of a release
+# (release.yml calls this file).
+#
+# Anything a contributor's pull request can trigger runs here, so everything here runs with
+# `permissions: contents: read` and no secrets: no step reads `secrets.*`, the trigger is
+# `pull_request` (never `pull_request_target`), and the checkout keeps no token.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash # -e -o pipefail: a failing command fails the step, inside a pipe too
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+      # The Rust this is developed with (rustc --version), as termcode pins it: a newer
+      # stable's new lints would otherwise fail a release. Bump on purpose, here and in
+      # release.yml's publish job (a release checks the two agree).
+      RUSTUP_TOOLCHAIN: 1.97.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+
+      # Two tests make real mount points in a bwrap sandbox (a user namespace), and skip
+      # where bwrap cannot make one.
+      - name: bwrap, for the mount tests
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      # A test that cannot run here prints "skipped: why" and passes. Each one becomes a
+      # warning on the run page, so a green run is never taken for full coverage.
+      - name: Test
+        run: |
+          cargo test --locked -- --show-output 2>&1 | tee "$RUNNER_TEMP/test.log"
+          awk '/^---- .* stdout ----$/ { t = $2 } /^skipped:/ { print "::warning title=Test skipped::" t ": " $0 }' "$RUNNER_TEMP/test.log"
+
+      # Every dependency's licence (all platforms' crates in Cargo.lock) must be made of these
+      # identifiers; anything else fails here for a person to look at. termdisk is GPL: these
+      # are all compatible with GPLv3, and a copyleft-incompatible one must stay out. (This
+      # is not termdisk's own licence: that is Cargo.toml's `license`.)
+      - name: Dependency licences
+        run: |
+          allowed="MIT Apache-2.0 BSL-1.0 Zlib Unicode-3.0 LLVM-exception"
+          cargo metadata --locked --format-version 1 |
+            jq -r '.packages[] | select(.source != null) | [.name + " " + .version, .license // "none"] | @tsv' \
+              > "$RUNNER_TEMP/licences"
+          test -s "$RUNNER_TEMP/licences"
+          status=0
+          set -f # the identifiers are split below; none of them may expand as a file pattern
+          while IFS=$'\t' read -r crate licence; do
+            for id in $(tr '/()' '   ' <<< "$licence"); do
+              case " OR AND WITH $allowed " in
+                *" $id "*) ;;
+                *) echo "::error title=Dependency licence::$crate: $licence"; status=1 ;;
+              esac
+            done
+          done < "$RUNNER_TEMP/licences"
+          echo "$(wc -l < "$RUNNER_TEMP/licences") dependencies checked"
+          exit "$status"
+
+      # The crate as crates.io would get it, built from the packaged files alone. A release
+      # publishes this same commit with `--no-verify` (release.yml), relying on this step.
+      - name: Package
+        run: cargo publish --dry-run --locked
+
+  # Cargo.toml's rust-version is a promise: the oldest Rust that builds termdisk. "1.93"
+  # means 1.93.0, so that exact release is checked, read from Cargo.toml.
+  msrv:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check with rust-version
+        run: |
+          v=$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)
+          test -n "$v"
+          case $v in *.*.*) ;; *) v=$v.0 ;; esac
+          echo "rust-version: $v"
+          rustup toolchain install "$v" --profile minimal
+          cargo "+$v" check --all-targets --locked
