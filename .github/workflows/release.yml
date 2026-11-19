@@ -1,0 +1,136 @@
+# A release, run when a version tag is pushed on main (git tag v0.2.1 && git push origin
+# v0.2.1): ci.yml's checks on that commit; the tag must name Cargo.toml's version, be on
+# main, and CHANGELOG.md must date it; the `crates-io` environment must require a reviewer;
+# then, once the owner approves, `cargo publish`, and a GitHub Release with that version's
+# CHANGELOG section.
+#
+# Run from the Actions tab (workflow_dispatch), on a branch or on a tag, it only checks (the
+# checks and the environment): every publishing job requires a tag *push*.
+#
+# Setup (the environment, its reviewer, the token): AGENTS.md, "Releases". The token is an
+# environment secret, read only by the one step that publishes. A partial release (published,
+# no GitHub Release) is finished with "Re-run failed jobs", which leaves the publish alone.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # The `crates-io` environment must make a person approve. A job naming an environment that
+  # does not exist creates it, unprotected; with a token wrongly stored as a repository secret,
+  # that would publish without anyone's click. No secret here, and it fails closed: an
+  # environment it cannot read, or without a required reviewer, stops the release before the
+  # approval prompt. It runs from the Actions tab too, to check the setup before a tag.
+  guard:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read # reading an environment (GET /repos/{repo}/environments/{name})
+    steps:
+      - name: The crates-io environment requires a reviewer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rules=$(gh api "repos/$GITHUB_REPOSITORY/environments/crates-io" --jq '.protection_rules[]?.type') ||
+            { echo "::error::cannot read the crates-io environment (missing, or no permission)"; exit 1; }
+          grep -qx required_reviewers <<< "$rules" ||
+            { echo "::error::the crates-io environment has no required reviewer: set it up as AGENTS.md says"; exit 1; }
+          echo "crates-io: a reviewer must approve"
+
+  tag:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # main's history, for the check below
+
+      - name: The tag names Cargo.toml's version, is on main, and CHANGELOG.md dates it
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml $version"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "::error::$GITHUB_REF_NAME is not on main"; exit 1; }
+          head=$(grep -m1 "^## \[$version\]" CHANGELOG.md) || { echo "::error::CHANGELOG.md has no ## [$version] section"; exit 1; }
+          if grep -qi unreleased <<< "$head"; then echo "::error::CHANGELOG.md: date the $version section"; exit 1; fi
+          awk -v h="## [$version]" 'index($0, h) == 1 { on = 1; next } /^## \[/ { on = 0 } on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md" || { echo "::error::the $version section is empty"; exit 1; }
+          # The publish job's Rust is the one ci.yml's dry run used.
+          pin() { grep -oE 'RUSTUP_TOOLCHAIN: [0-9][0-9.]*' "$1" | sort -u || true; }
+          rust=$(pin .github/workflows/ci.yml)
+          test -n "$rust" && test "$rust" = "$(pin .github/workflows/release.yml)" ||
+            { echo "::error::ci.yml and release.yml pin different Rust"; exit 1; }
+          echo "termdisk $version: tag, main and CHANGELOG agree; $rust"
+
+  # crates.io, after the owner's click: the `crates-io` environment requires their review
+  # and only v* tags may use it.
+  publish:
+    needs: [ci, tag, guard] # ci: `cargo publish --dry-run --locked` on this same commit
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: crates-io
+    env:
+      # The Rust of ci.yml's dry run (the tag job checks the two agree). The variable wins
+      # over any toolchain file.
+      RUSTUP_TOOLCHAIN: 1.97.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      # Beside the token runs rustup's cargo of RUSTUP_TOOLCHAIN, packing this commit's files,
+      # and the repository's cargo and rustup configuration would run too: a toolchain file
+      # can name its own binaries, a cargo config a credential provider that gets the token.
+      # Neither may be in a release. --no-verify: nothing is built, so no build script runs;
+      # the build was ci's `cargo publish --dry-run --locked` on this same commit (needs: ci).
+      - name: Publish on crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          for f in .cargo/config .cargo/config.toml rust-toolchain rust-toolchain.toml; do
+            if [ -e "$f" ] || [ -L "$f" ]; then echo "::error::$f in a release: refused"; exit 1; fi
+          done
+          test -n "$CARGO_REGISTRY_TOKEN" || { echo "::error::no CARGO_REGISTRY_TOKEN in the crates-io environment"; exit 1; }
+          cargo publish --locked --no-verify
+
+  github-release:
+    needs: publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # the only job that writes: it creates the Release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: GitHub Release with this version's CHANGELOG section
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "::notice::the release $GITHUB_REF_NAME exists already: left as it is"
+            exit 0
+          fi
+          awk -v h="## [$version]" 'index($0, h) == 1 { on = 1; next } /^## \[/ { on = 0 } on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "termdisk $version" --notes-file "$RUNNER_TEMP/notes.md"
