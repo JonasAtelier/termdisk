@@ -2,6 +2,14 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
+## [0.2.2] - 2026-11-19
+
+### Changed
+- Releases reach crates.io through its Trusted Publishing: the release job, once the owner
+  approves, gets a token from crates.io for 30 minutes (GitHub's OIDC, this repository's
+  `release.yml` in its `crates-io` environment), so no token is stored any more. termdisk
+  itself is as in 0.2.1.
+
 ## [0.2.1] - 2026-11-19
 
 ### Changed
