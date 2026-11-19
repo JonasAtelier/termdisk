@@ -2,6 +2,16 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
+## [0.2.1] - Unreleased
+
+### Changed
+- The licence: from this version termdisk is GPL-3.0-only (0.2.0 and earlier: MIT).
+- The crate is ready for crates.io: its description, keywords and categories, and only the
+  code, tests, examples and documents in the package.
+- CI on GitHub Actions: format, lint, tests, dependency licences, the package and the oldest
+  supported Rust on every push to main and every pull request; a version tag publishes on
+  crates.io and makes the GitHub Release, after the owner approves.
+
 ## [0.2.0] - 2026-11-19
 
 ### Changed

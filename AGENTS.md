@@ -5,6 +5,9 @@
 library and a CLI in one crate. The library has no terminal code; keep it that way (termcode
 embeds it).
 
+Licence: GPL-3.0-only (`LICENSE`, `license` in `Cargo.toml`; 0.2.0 and earlier were MIT).
+Contributions are accepted under it. Each source file starts with its SPDX line.
+
 - `src/lib.rs`: the public API, `fmt_size`, and `TempDir`, the temporary folder every test
   that writes files works in.
 - `src/tree.rs`: the scan result: an arena of 56-byte `Node`s (a folder's children stored
@@ -79,3 +82,47 @@ for a new feature or a huge change (a new chart or view), Y for a change to an e
 (the tree, the treemap, the scan, a CLI flag), Z for bug fixes. A release bumps only the
 largest kind it holds, the lower numbers back to 0 (1.4.2 with a fix and a treemap change:
 1.5.0).
+
+## Releases
+
+`.github/workflows/ci.yml` checks every push to main and every pull request (format, lint,
+tests with the skipped ones as warnings, dependency licences, the package, rust-version), with
+read-only permissions and no secrets. `.github/workflows/release.yml` runs on a `v*` tag:
+those checks, the tag against `Cargo.toml` and `CHANGELOG.md`, a check that the `crates-io`
+environment requires a reviewer, then `cargo publish` once the owner approves, then the GitHub
+Release with that version's CHANGELOG section. Rust is pinned in `ci.yml` and in
+`release.yml`'s publish job (`RUSTUP_TOOLCHAIN`, the same version: a release checks it); bump
+both on purpose. Actions are pinned by commit SHA. A release refuses a `.cargo/config*` or a
+`rust-toolchain*` file in the repository: they would run beside the token.
+
+Once, in this order, before the first tag:
+1. The `crates-io` environment, the owner as its reviewer, only `v*` tags may use it (a tag
+   pushed before it exists makes an unprotected one; the release's check then stops it).
+2. The token, as that environment's secret only (`--env crates-io`), never as a repository
+   secret: those reach every job without review.
+3. Actions, release, Run workflow on main: the `guard` job says whether the environment is
+   protected; nothing is published from there.
+
+The commands for 1 and 2:
+
+    gh api -X PUT repos/JonasAtelier/termdisk/environments/crates-io --input - <<EOF
+    {"reviewers": [{"type": "User", "id": $(gh api user -q .id)}],
+     "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+    EOF
+    gh api -X POST repos/JonasAtelier/termdisk/environments/crates-io/deployment-branch-policies \
+      -f name='v*' -f type=tag
+    gh secret set CARGO_REGISTRY_TOKEN --env crates-io --repo JonasAtelier/termdisk
+
+The token comes from crates.io, Account Settings, API Tokens: scopes `publish-new` and
+`publish-update`, crate `termdisk`, with an expiry; after the first release `publish-update`
+is enough.
+
+To do after the first publish: switch to crates.io's Trusted Publishing (GitHub OIDC, no
+stored token) and revoke the token.
+
+A release: the version in `Cargo.toml`, its `CHANGELOG.md` section dated, committed on main
+and green in CI; then `git tag vX.Y.Z && git push origin vX.Y.Z`, and approve the
+`crates-io` deployment in the run. If it stops after the publish (no GitHub Release), use
+"Re-run failed jobs": it reruns only what failed, never a publish that succeeded (crates.io
+takes a version once, so "Re-run all jobs" would fail there). An existing GitHub Release is
+left as it is.
