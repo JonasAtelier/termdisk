@@ -2,6 +2,15 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
+## [0.2.0] - Unreleased
+
+### Changed
+- The tree: a double click on a folder opens it where it is, its contents indented under it;
+  another double click closes it (folders start closed, as before). It no longer shows that
+  folder: Enter, or a double click on its tile in the treemap, still does. A double click on a
+  file, or on the folder shown, does nothing; a third quick click is a single click. When a
+  folder closes around the selection, the selection moves up to it.
+
 ## [0.1.0] - Unreleased
 
 ### Added

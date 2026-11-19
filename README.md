@@ -15,12 +15,14 @@ termdisk --summary [PATH]   scan PATH (default: the current folder) and print it
 
 The left pane is the folder tree (name, usage bar, size, items, last change), largest first;
 the right pane is a treemap of the folder shown. Selecting in one selects in the other.
+Folders in the tree start closed.
 
 | Key | |
 |---|---|
 | ↑ ↓ PgUp PgDn Home End | move |
 | → ← (or + -) | open, close a folder |
-| Enter, double click | show that folder |
+| double click on a folder in the tree | open it where it is; again: close it |
+| Enter, double click on a tile | show that folder |
 | Backspace | show the folder above |
 | Del | move to the trash (asks first) |
 | o | open with the default program |
