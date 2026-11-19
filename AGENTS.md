@@ -95,15 +95,19 @@ Release with that version's CHANGELOG section. Rust is pinned in `ci.yml` and in
 both on purpose. Actions are pinned by commit SHA. A release refuses a `.cargo/config*` or a
 `rust-toolchain*` file in the repository: they would run beside the token.
 
-Once, in this order, before the first tag:
-1. The `crates-io` environment, the owner as its reviewer, only `v*` tags may use it (a tag
-   pushed before it exists makes an unprotected one; the release's check then stops it).
-2. The token, as that environment's secret only (`--env crates-io`), never as a repository
-   secret: those reach every job without review.
-3. Actions, release, Run workflow on main: the `guard` job says whether the environment is
-   protected; nothing is published from there.
+No token is stored. The publish job uses crates.io's Trusted Publishing:
+`rust-lang/crates-io-auth-action` trades GitHub's OIDC token for a crates.io token that lasts
+30 minutes and is revoked when the job ends. crates.io trusts only what the crate's
+configuration names (crates.io, termdisk, Settings, Trusted Publishing, GitHub):
 
-The commands for 1 and 2:
+    Repository owner   JonasAtelier
+    Repository name    termdisk
+    Workflow filename  release.yml
+    Environment        crates-io
+
+Renaming the workflow file or the environment breaks publishing until the configuration
+follows. The `crates-io` environment is what makes a person approve; it was made once with
+(the owner as reviewer, only `v*` tags may use it):
 
     gh api -X PUT repos/JonasAtelier/termdisk/environments/crates-io --input - <<EOF
     {"reviewers": [{"type": "User", "id": $(gh api user -q .id)}],
@@ -111,14 +115,16 @@ The commands for 1 and 2:
     EOF
     gh api -X POST repos/JonasAtelier/termdisk/environments/crates-io/deployment-branch-policies \
       -f name='v*' -f type=tag
-    gh secret set CARGO_REGISTRY_TOKEN --env crates-io --repo JonasAtelier/termdisk
 
-The token comes from crates.io, Account Settings, API Tokens: scopes `publish-new` and
-`publish-update`, crate `termdisk`, with an expiry; after the first release `publish-update`
-is enough.
+Actions, release, Run workflow on main runs the `guard` job, which says whether the
+environment still needs a person; nothing is published from there.
 
-To do after the first publish: switch to crates.io's Trusted Publishing (GitHub OIDC, no
-stored token) and revoke the token.
+The move from the stored token (0.2.1 was published with it), in this order: add the
+configuration above on crates.io; the environment secret `CARGO_REGISTRY_TOKEN` may stay
+(unused) until a release has published through Trusted Publishing; then revoke that token on
+crates.io (Account Settings, API Tokens), delete the secret (`gh secret delete
+CARGO_REGISTRY_TOKEN --env crates-io --repo JonasAtelier/termdisk`), and turn on "require
+Trusted Publishing" in the crate's settings, so no token can publish it any more.
 
 A release: the version in `Cargo.toml`, its `CHANGELOG.md` section dated, committed on main
 and green in CI; then `git tag vX.Y.Z && git push origin vX.Y.Z`, and approve the
