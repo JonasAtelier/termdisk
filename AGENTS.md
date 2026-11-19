@@ -25,6 +25,13 @@ embeds it).
   mouse, `tick`/`next_wake` (when nothing waits, the host may block on input). Its tests drive
   it with synthetic events into a `Buffer`.
 - `src/draw.rs`: the view drawn into a ratatui `Buffer` (cells only).
+- `src/style.rs`: `Colors` (termcode's defaults, `fitted` to 256 or 16 colours once) and
+  `IconSet` (termcode's Nerd, Unicode and ASCII glyphs, each one cell). Plain data; a host
+  passes its own. Keep every non-colour cue (the selection's edge mark and bold, the lock,
+  bold and crossed-out buttons, the tiles' class letters and the selected tile's outline): in
+  16 colours the selection is as black as the pane. Hover is styling only: `View::hover_at`
+  looks where a click looks, and Move to Trash is drawn disabled exactly when a click on it
+  would do nothing (`Confirm::clickable`), hovered or not.
 - `src/main.rs`: the CLI: the terminal (raw mode, alternate screen, mouse, bracketed paste so
   pasted text never arrives as keys), put back on quit, error, panic and SIGINT/SIGTERM/SIGHUP
   (a `sigwait` thread); `xdg-open`; OSC 52; `--summary`.

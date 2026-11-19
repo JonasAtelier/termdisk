@@ -10,6 +10,22 @@ What changed in each termdisk release, newest first. The version rule is in `AGE
   folder: Enter, or a double click on its tile in the treemap, still does. A double click on a
   file, or on the folder shown, does nothing; a third quick click is a single click. When a
   folder closes around the selection, the selection moves up to it.
+- The look is termcode's: its colours (VS Code's dark theme: the grey title bar with the path
+  in the middle, the blue status bar, the side-bar grey tree with its column headings, the
+  blue selection), its icons (Nerd Font codicons, Unicode or ASCII, each one cell; the lock is
+  now one cell wide too), thin usage bars, and its rounded popups for the trash dialog and the
+  keys, the button with the focus in blue. A Move to Trash that cannot be used yet is dim and
+  crossed out. In 16 colours or ASCII the selection keeps a mark at its edge and stays bold.
+  `TERMDISK_COLORS` and `TERMDISK_ICONS` override what is detected. Library: `Colors`,
+  `Depth`, `IconSet`, `View::set_colors`, `View::set_icons`.
+- The map is coloured by type (from the name), or by age with the new `t` key, under a
+  one-line legend; every tile starts with its class letter. The selected tile has an outline.
+- The pointer lights up rows, places, tiles, the dialog's buttons and the status bar's items
+  (which can now be clicked: `a`, `t`, `?`). The tree has a scrollbar.
+- A running scan shows a card with a spinner, the rate and the time taken.
+- After a move to the trash the status bar says what went, how many items and how big, with a
+  check mark, until the next key or click.
+- An `fc-list` that hangs is killed after 2 s, or when termdisk ends.
 
 ## [0.1.0] - Unreleased
 

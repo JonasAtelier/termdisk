@@ -28,6 +28,7 @@ Folders in the tree start closed.
 | o | open with the default program |
 | c | copy the path (OSC 52) |
 | a | disk usage / apparent size |
+| t | map colours: by type / by age |
 | v | tree and map / tree / map |
 | r | scan again |
 | ? | all the keys |
@@ -35,7 +36,15 @@ Folders in the tree start closed.
 
 In the dialog for Del, Cancel has the focus, so Enter alone cancels; Tab (or an arrow) and
 Enter, or a click, moves the item. For half a second after the dialog opens, only Cancel
-works. Items that cannot be trashed show a 🔒, and Del on one says why.
+works. Items that cannot be trashed show a lock (`⊘`, or `!` in ASCII), and Del on one says
+why. After a move the status bar says what went and how big it was until the next key or
+click, which also does what it always does.
+
+The map is coloured by type (from the name only) or, with `t`, by the age of the last
+change; each tile starts with its class letter, explained in the legend above the map
+(`/` folder, `V` video, `I` image, `A` audio, `Z` archive, `D` document, `T` code and text,
+`O` other; `W` this week, `M` this month, `Y` this year, `O` older), so colour is not needed
+to read it. The items at the right of the status bar (`a`, `t`, `?`) can be clicked.
 
 The scan reads folders on several threads. It never follows symbolic links (only the path
 given is resolved, as `cd` would), stays on PATH's filesystem (mount points under it, bind
@@ -53,6 +62,25 @@ also refuses anything not wholly yours, anything with a mount point in it, and a
 another filesystem than the trash (where `/tmp` is a tmpfs, that includes `/tmp`). To protect
 more, list paths in `~/.config/termdisk/protect`, one per line (absolute or `~/...`). It does
 nothing at all when run as root or setuid.
+
+## Look
+
+termdisk looks like termcode: its default colours (VS Code's dark theme) and its three icon
+sets. The colours are fitted to what the terminal shows, from `COLORTERM` and `TERM`; set
+`TERMDISK_COLORS=truecolor`, `256` or `16` where that guess is wrong (tmux without true
+colour, some ssh sessions). The icons are a Nerd Font's when one is installed (asked of
+fontconfig as termcode does; Unicode over ssh); set `TERMDISK_ICONS=nerd`, `unicode` or
+`ascii`. A terminal that draws East Asian Ambiguous characters two cells wide (a CJK locale
+setting in some terminals) misplaces the Unicode set's arrows, bars and box lines: use
+`TERMDISK_ICONS=ascii` there. The selection, the lock on what cannot be trashed and the
+dialog's focus also show without colour: a mark at the row's edge, a lock sign, bold and
+crossed-out buttons.
+
+## Third-party
+
+The default colours are VS Code's (Copyright (c) Microsoft Corporation, MIT License; the full
+text is in `THIRD-PARTY-LICENSES`). Colour fitting and the icon sets are adapted from
+termcode (MIT, the same author).
 
 ## Build
 
