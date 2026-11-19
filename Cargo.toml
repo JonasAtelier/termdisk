@@ -6,6 +6,11 @@ rust-version = "1.93"
 description = "A disk usage analyzer with a treemap, in the terminal"
 repository = "https://github.com/JonasAtelier/termdisk"
 license = "GPL-3.0-only"
+readme = "README.md"
+keywords = ["disk-usage", "treemap", "tui", "terminal", "du"]
+categories = ["command-line-utilities", "filesystem"]
+# The crate: the code, its tests, its docs; not the benchmark and smoke scripts.
+include = ["src/**", "tests/**", "examples/**", "LICENSE", "THIRD-PARTY-LICENSES", "README.md", "CHANGELOG.md"]
 
 [dependencies]
 # The system calls (sys.rs, trash.rs), getpwuid_r, statvfs, localtime_r, signal masks.
