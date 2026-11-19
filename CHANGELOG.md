@@ -2,6 +2,27 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
+## [0.3.0] - Unreleased
+
+### Changed
+- The tree sorts by name, size, items or last change, either way round: a click on a column
+  heading (Usage sorts by size; again: the other way), or `s` (the next column) and `S` (the
+  other way). Names go A to Z with capitals and small letters together; the other columns
+  start largest or newest first. The heading sorted by has an arrow. The default is still
+  size, largest first, and the selection stays on its item.
+- The Usage column shows the share of its folder as a percentage before the bar ("41%";
+  "<1%" below half a percent, ">99%" for nearly all, "100%" only for all); the bar is 8 cells.
+  A narrow tree keeps the column it is sorted by.
+- The map follows the selection: it shows the folder that holds the selected row (on the
+  shown folder's own row, that folder), so moving down into an open folder shows its map. Its
+  legend starts with that folder's name. The map stays largest first whatever the tree's order.
+- The map's tiles take 8 colours in turn, so neighbouring tiles differ, and only the selected
+  tile is blue, also in 256 and 16 colours (the "+N items" tile when the selected item is among
+  them). The tiles keep their type or age letters (`t` now switches only those), and the
+  legend lists the letters without colours.
+- Library: `Colors::kinds` and `Colors::ages` are replaced by `Colors::tiles` and
+  `Colors::sel_tile`.
+
 ## [0.2.2] - 2026-11-19
 
 ### Changed

@@ -4,8 +4,10 @@
 //! ratatui `Buffer` (draw.rs) and takes crossterm events, both only as data: the terminal itself
 //! belongs to the host (the CLI in main.rs, or termcode).
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -54,6 +56,48 @@ pub(crate) enum Panes {
     Map,
 }
 
+/// A column the tree can be sorted by (the treemap is always by size, largest first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Field {
+    Name,
+    Size,
+    Items,
+    Modified,
+}
+
+/// The tree's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Sort {
+    pub by: Field,
+    pub descending: bool,
+}
+
+impl Default for Sort {
+    fn default() -> Sort {
+        Sort {
+            by: Field::Size,
+            descending: true,
+        }
+    }
+}
+
+impl Sort {
+    /// Sorted by `field`: the field it is sorted by already turns round; another starts in its
+    /// natural order (names A to Z; sizes, item counts and times largest or newest first).
+    pub fn by(self, field: Field) -> Sort {
+        match field == self.by {
+            true => Sort {
+                descending: !self.descending,
+                ..self
+            },
+            false => Sort {
+                by: field,
+                descending: field != Field::Name,
+            },
+        }
+    }
+}
+
 pub struct View {
     pub(crate) policy: Policy,
     pub(crate) screen: Screen,
@@ -75,8 +119,10 @@ pub struct View {
     pub(crate) scan_started: Instant,
     pub(crate) colors: Colors,
     pub(crate) icons: IconSet,
-    /// The treemap is coloured by age rather than by type.
+    /// The treemap's letters are by age rather than by type.
     pub(crate) by_age: bool,
+    /// The tree's order (kept for the next scan, as `apparent` is).
+    sort: Sort,
     /// Where the mouse pointer was last seen, and what was under it in the last drawing.
     pub(crate) pointer: Option<(u16, u16)>,
     pub(crate) hover: Hover,
@@ -89,10 +135,12 @@ pub(crate) enum Hover {
     #[default]
     Nothing,
     Place(usize),
-    /// A tree row (its index in `Browse::rows`), a tile (in `Hits::tiles`), a status bar item.
+    /// A tree row (its index in `Browse::rows`), a tile (in `Hits::tiles`), a status bar item, a
+    /// column heading (in `Hits::heads`).
     Row(usize),
     Tile(usize),
     Item(usize),
+    Head(usize),
     Cancel,
     Move,
 }
@@ -137,8 +185,12 @@ pub(crate) struct Browse {
     pub confirm: Option<Confirm>,
     /// Sorted by apparent size rather than disk usage (the view's mode).
     apparent: bool,
-    /// Children sorted by size, largest first, trashed ones left out.
+    /// The tree's order (the view's).
+    pub sort: Sort,
+    /// Children sorted by size, largest first, trashed ones left out (the treemap's order).
     sorted: HashMap<NodeId, Vec<NodeId>>,
+    /// The same in the tree's order.
+    ordered: HashMap<NodeId, Vec<NodeId>>,
 }
 
 /// Which handler a key goes to.
@@ -198,6 +250,8 @@ pub(crate) struct Hits {
     pub scrollbar: Rect,
     /// The status bar's items, and the key a click on one presses.
     pub items: Vec<(Rect, char)>,
+    /// The tree's column headings, and what a click on one sorts by.
+    pub heads: Vec<(Rect, Field)>,
 }
 
 impl View {
@@ -219,6 +273,7 @@ impl View {
             progress_drawn: Instant::now(),
             scan_started: Instant::now(),
             by_age: false,
+            sort: Sort::default(),
             pointer: None,
             hover: Hover::Nothing,
         };
@@ -326,7 +381,9 @@ impl View {
             trash_reaches,
             confirm: None,
             apparent: self.apparent,
+            sort: self.sort,
             sorted: HashMap::new(),
+            ordered: HashMap::new(),
         };
         b.rebuild(None);
         b.cursor = usize::from(b.rows.len() > 1);
@@ -443,9 +500,22 @@ impl View {
                 self.apparent = !self.apparent;
                 b.apparent = self.apparent;
                 b.sorted.clear();
+                b.ordered.clear();
                 b.rebuild(Some(sel));
             }
             KeyCode::Char('t') => self.by_age = !self.by_age,
+            // The next column in its natural order, or the same one turned round.
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                let field = match (key.code, self.sort.by) {
+                    (KeyCode::Char('S'), by) => by,
+                    (_, Field::Name) => Field::Size,
+                    (_, Field::Size) => Field::Items,
+                    (_, Field::Items) => Field::Modified,
+                    (_, Field::Modified) => Field::Name,
+                };
+                self.sort = self.sort.by(field);
+                b.resort(self.sort, sel);
+            }
             KeyCode::Char('r') => {
                 let root = b.tree.root_path().to_path_buf();
                 self.start_scan(&root);
@@ -532,6 +602,7 @@ impl View {
                 self.done = true;
                 b.tree.mark_trashed(c.id);
                 b.sorted.clear();
+                b.ordered.clear();
                 if c.id == b.zoom {
                     b.zoom = b.tree.parent(c.id).unwrap_or(0);
                 }
@@ -593,6 +664,8 @@ impl View {
             self.browse_key(KeyEvent::new(KeyCode::Char(k), KeyModifiers::NONE));
             return Outcome::Redraw;
         }
+        // A column heading sorts the tree by it.
+        let head = self.hits.heads.iter().find(|h| inside(h.0)).map(|h| h.1);
         match &mut self.screen {
             Screen::Start(s) if inside(self.hits.places) => {
                 let row = usize::from(y - self.hits.places.y);
@@ -616,6 +689,11 @@ impl View {
                 } else {
                     return Outcome::None;
                 }
+            }
+            Screen::Browse(b) if head.is_some() => {
+                let sel = b.rows[b.cursor].0;
+                self.sort = head.map_or(self.sort, |f| self.sort.by(f));
+                b.resort(self.sort, sel);
             }
             Screen::Browse(b) if inside(self.hits.rows) => {
                 let row = b.top + usize::from(y - self.hits.rows.y);
@@ -671,6 +749,9 @@ impl View {
             },
             Screen::Browse(_) if h.items.iter().any(|i| inside(i.0)) => {
                 Hover::Item(h.items.iter().position(|i| inside(i.0)).unwrap_or(0))
+            }
+            Screen::Browse(_) if h.heads.iter().any(|i| inside(i.0)) => {
+                Hover::Head(h.heads.iter().position(|i| inside(i.0)).unwrap_or(0))
             }
             Screen::Browse(b) if inside(h.rows) => match b.top + usize::from(y - h.rows.y) {
                 row if row < b.rows.len() => Hover::Row(row),
@@ -733,7 +814,7 @@ impl Browse {
         while let Some((id, depth)) = stack.pop() {
             rows.push((id, depth));
             if self.open.contains(&id) || id == self.zoom {
-                let kids = self.kids(id).to_vec();
+                let kids = self.ordered(id);
                 stack.extend(kids.into_iter().rev().map(|k| (k, depth + 1)));
             }
         }
@@ -800,16 +881,56 @@ impl Browse {
         self.rebuild(Some(was));
     }
 
-    /// The child of `zoom` that `id` is or lies under (its tile in the treemap).
-    pub fn tile_of(&self, mut id: NodeId) -> Option<NodeId> {
-        loop {
-            let p = self.tree.parent(id)?;
-            if p == self.zoom {
-                return Some(id);
-            }
-            id = p;
+    /// The treemap's folder and its selected tile: the folder that holds the selected row, and
+    /// that row's item; on the shown folder's own row, that folder and no tile.
+    pub fn map_of(&self) -> (NodeId, Option<NodeId>) {
+        let sel = self.rows[self.cursor].0;
+        match self.tree.parent(sel).filter(|_| sel != self.zoom) {
+            Some(p) => (p, Some(sel)),
+            None => (self.zoom, None),
         }
     }
+
+    /// The children of `id` in the tree's order: `kids` sorted again, stably, so items equal in
+    /// the sorted column stay largest first.
+    fn ordered(&mut self, id: NodeId) -> Vec<NodeId> {
+        if let Some(kids) = self.ordered.get(&id) {
+            return kids.clone();
+        }
+        let mut kids = self.kids(id).to_vec();
+        let (tree, apparent, sort) = (&self.tree, self.apparent, self.sort);
+        kids.sort_by(|&a, &b| {
+            let (x, y) = (tree.node(a), tree.node(b));
+            let order = match sort.by {
+                Field::Name => by_name(tree.name(a).as_bytes(), tree.name(b).as_bytes()),
+                Field::Size => counted(x, apparent).cmp(&counted(y, apparent)),
+                Field::Items => x.items.cmp(&y.items), // a file has none
+                Field::Modified => x.mtime.cmp(&y.mtime),
+            };
+            if sort.descending {
+                order.reverse()
+            } else {
+                order
+            }
+        });
+        self.ordered.insert(id, kids.clone());
+        kids
+    }
+
+    /// The tree in `sort`'s order, the selection still on `keep`.
+    fn resort(&mut self, sort: Sort, keep: NodeId) {
+        self.sort = sort;
+        self.ordered.clear();
+        self.rebuild(Some(keep));
+    }
+}
+
+/// Names A to Z, capitals and small letters together (ASCII only), then byte by byte.
+fn by_name(a: &[u8], b: &[u8]) -> Ordering {
+    let (x, y) = (a.iter(), b.iter());
+    x.map(u8::to_ascii_lowercase)
+        .cmp(y.map(u8::to_ascii_lowercase))
+        .then_with(|| a.cmp(b))
 }
 
 #[cfg(test)]
@@ -1748,7 +1869,8 @@ mod tests {
         let (_t, home) = home("view-link");
         let mut v = ready(policy(&home, None), &home.join(".cache"));
         select(&mut v, "linked");
-        assert!(has(&text(&mut v, 120, 40), "linked (hard link)"));
+        // 130 wide: at 120 the name column (24 cells beside Usage, Size and Modified) cuts it.
+        assert!(has(&text(&mut v, 130, 40), "linked (hard link)"));
         key(&mut v, KeyCode::Delete);
         assert!(has(&text(&mut v, 120, 40), "may free nothing"));
     }
@@ -1802,7 +1924,7 @@ mod tests {
         select(&mut v, "big");
         let b = browse(&mut v);
         let big = b.rows[b.cursor].0;
-        assert_eq!(b.tile_of(big), Some(big), "the row selects its tile");
+        assert_eq!(b.map_of(), (0, Some(big)), "the row selects its tile");
         // A double click on the "big" row opens it where it is; another closes it.
         let (x, y) = cell_of(&mut v, "big");
         click(&mut v, x, y);
@@ -1884,7 +2006,7 @@ mod tests {
         b.open.remove(&big);
         b.rebuild(Some(f0));
         assert_eq!(selected_name(&mut v), "big", "not a row that is gone");
-        assert_eq!(browse(&mut v).tile_of(big), Some(big), "the map follows");
+        assert_eq!(browse(&mut v).map_of(), (0, Some(big)), "the map follows");
         // The same through the mouse: the click lands on big first, the double click closes it.
         browse(&mut v).select(f0);
         let (x, y) = cell_of(&mut v, "big");
@@ -1892,6 +2014,211 @@ mod tests {
         click(&mut v, x, y);
         assert_eq!(selected_name(&mut v), "big");
         assert!(!row_shown(&mut v, "f0"));
+    }
+
+    /// The names on the map's tiles, and those drawn in the selected tile's colour.
+    fn tiles(v: &mut View, w: u16, h: u16) -> (Vec<String>, Vec<String>) {
+        let buf = draw_buf(v, w, h);
+        let blue = v.colors.sel_tile;
+        let hits = v.hits.tiles.clone();
+        let b = browse(v);
+        let name = |id: Option<NodeId>| match id {
+            Some(id) => b.tree.name(id).to_string_lossy().into_owned(),
+            None => "+".to_string(),
+        };
+        let all = hits.iter().map(|t| name(t.1)).collect();
+        let lit = hits
+            .iter()
+            .filter(|t| buf[(t.0.x, t.0.y)].bg == blue)
+            .map(|t| name(t.1))
+            .collect();
+        (all, lit)
+    }
+
+    #[test]
+    fn the_map_shows_the_folder_of_the_selected_row_and_only_its_tile_in_blue() {
+        let (_t, home) = home("view-map-follows");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        assert_eq!(selected_name(&mut v), "big");
+        let (all, lit) = tiles(&mut v, 120, 40);
+        assert_eq!(all, ["big", "linked", "small"]);
+        assert_eq!(lit, ["big"]);
+        assert!(has(&text(&mut v, 120, 40), "100% ━"), "root row");
+        // Into big: the map shows big's items, the selected one in blue.
+        key(&mut v, KeyCode::Right);
+        key(&mut v, KeyCode::Down);
+        assert_eq!(selected_name(&mut v), "inner");
+        let (all, lit) = tiles(&mut v, 120, 40);
+        assert!(all == ["inner"] && lit == ["inner"], "{all:?} {lit:?}");
+        let map: Vec<String> = text(&mut v, 120, 40)
+            .iter()
+            .map(|l| l.chars().skip(61).collect())
+            .collect();
+        let legend = &map[1];
+        assert!(legend.starts_with(" big/ "), "{legend:?}");
+        // Into inner: its files, each tile in a colour of its own but for the selected one.
+        key(&mut v, KeyCode::Right);
+        key(&mut v, KeyCode::Down);
+        let first = selected_name(&mut v);
+        let (all, lit) = tiles(&mut v, 120, 40);
+        assert_eq!((all.len(), lit), (20, vec![first.clone()]));
+        let buf = draw_buf(&mut v, 120, 40);
+        let hits = v.hits.tiles.clone();
+        let bgs: Vec<_> = hits.iter().map(|t| buf[(t.0.x, t.0.y)].bg).collect();
+        assert!(bgs.windows(2).all(|w| w[0] != w[1]), "{bgs:?}");
+        // A click on another of its tiles selects that row; the map stays on inner.
+        let (r, id) = hits[19];
+        click(&mut v, r.x + 1, r.y);
+        let b = browse(&mut v);
+        assert_eq!(b.rows[b.cursor].0, id.unwrap(), "the row of that tile");
+        let name = selected_name(&mut v);
+        assert_ne!(name, first);
+        assert_eq!(tiles(&mut v, 120, 40).1, [name]);
+        // Too small for tiles of their own: the "+20 items" tile holds the selected one.
+        v.panes = Panes::Map;
+        let (all, lit) = tiles(&mut v, 24, 6);
+        assert!(all == ["+"] && lit == ["+"], "{all:?} {lit:?}");
+        v.panes = Panes::Both;
+        // On the shown folder's row: its items, none selected.
+        key(&mut v, KeyCode::Home);
+        let (all, lit) = tiles(&mut v, 120, 40);
+        assert_eq!((all.len(), lit.len()), (3, 0));
+    }
+
+    #[test]
+    fn with_tiles_and_small_items_together_only_the_selected_one_is_blue() {
+        let (_t, home) = home("view-mixed");
+        let mixed = home.join(".cache/mixed");
+        fs::create_dir(&mixed).unwrap();
+        fs::write(mixed.join("a"), vec![0u8; 120_000]).unwrap();
+        fs::write(mixed.join("b"), vec![0u8; 100_000]).unwrap();
+        for i in 0..20 {
+            fs::write(mixed.join(format!("s{i}")), vec![0u8; 3000]).unwrap();
+        }
+        let mut v = ready(policy(&home, None), &mixed);
+        key(&mut v, KeyCode::Char('a')); // apparent sizes: the lengths, whatever the disk does
+        v.panes = Panes::Map;
+        // 40x12: a and b get tiles, the twenty small files one "+20 items" tile.
+        for (name, blue) in [("b", "b"), ("s7", "+"), ("a", "a"), ("s0", "+")] {
+            select(&mut v, name);
+            let (all, lit) = tiles(&mut v, 40, 12);
+            assert_eq!(all, ["a", "b", "+"]);
+            assert_eq!(lit, [blue], "{name}");
+        }
+    }
+
+    /// The names of the rows under the shown folder, in the tree's order.
+    fn order(v: &mut View) -> Vec<String> {
+        let b = browse(v);
+        let names = b.rows[1..].iter().map(|r| b.tree.name(r.0));
+        names.map(|n| n.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn apparent_sizes_reorder_a_tree_sorted_by_size() {
+        let (_t, home) = home("view-apparent-order");
+        let dir = home.join(".cache/sizes");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("dense"), vec![1u8; 50_000]).unwrap();
+        // A hole: a million bytes long, no blocks on the disk.
+        let sparse = fs::File::create(dir.join("sparse")).unwrap();
+        sparse.set_len(1_000_000).unwrap();
+        let mut v = ready(policy(&home, None), &dir);
+        assert_eq!(order(&mut v), ["dense", "sparse"], "by disk usage");
+        key(&mut v, KeyCode::Char('a'));
+        assert_eq!(browse(&mut v).sort, Sort::default());
+        assert_eq!(order(&mut v), ["sparse", "dense"], "by apparent size");
+        key(&mut v, KeyCode::Char('a'));
+        assert_eq!(order(&mut v), ["dense", "sparse"]);
+    }
+
+    #[test]
+    fn a_narrow_tree_keeps_the_column_it_is_sorted_by() {
+        let (_t, home) = home("view-sorted-column");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        key(&mut v, KeyCode::Char('s'));
+        assert!(has(&text(&mut v, 120, 40), "Items▾"));
+        let heads: Vec<Field> = v.hits.heads.iter().map(|h| h.1).collect();
+        assert_eq!(heads, [Field::Name, Field::Size, Field::Size, Field::Items]);
+        // Every sort at every width: the headings stay in the tree pane, the names keep 24 cells
+        // (the Name heading starts a cell in) beside any other column, and the sorted column is
+        // there wherever it fits beside them.
+        for _ in 0..4 {
+            key(&mut v, KeyCode::Char('s'));
+            let by = browse(&mut v).sort.by;
+            for w in 24..=140 {
+                text(&mut v, w, 12);
+                let (heads, pane) = (v.hits.heads.clone(), v.hits.rows);
+                let at = format!("{by:?} at {w}: {heads:?}");
+                assert!(heads.iter().all(|h| h.0.right() <= pane.right()), "{at}");
+                assert!(heads.len() == 1 || heads[0].0.width >= 23, "{at}");
+                assert!(w < 40 || heads.iter().any(|h| h.1 == by), "{at}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_tree_sorts_by_each_column_both_ways_and_keeps_the_selection() {
+        let (_t, home) = home("view-sort");
+        let cache = home.join(".cache");
+        for (name, secs) in [("linked", 1_000), ("big", 2_000), ("small", 3_000)] {
+            let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+            fs::File::open(cache.join(name))
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        }
+        let mut v = ready(policy(&home, None), &cache);
+        assert_eq!(browse(&mut v).sort, Sort::default());
+        assert_eq!(order(&mut v), ["big", "linked", "small"], "largest first");
+        select(&mut v, "linked");
+        // big holds 21 items, the files none: equal ones stay largest first.
+        let steps = [
+            ('s', Field::Items, true, ["big", "linked", "small"]),
+            ('S', Field::Items, false, ["linked", "small", "big"]),
+            ('s', Field::Modified, true, ["small", "big", "linked"]),
+            ('S', Field::Modified, false, ["linked", "big", "small"]),
+            ('s', Field::Name, false, ["big", "linked", "small"]),
+            ('S', Field::Name, true, ["small", "linked", "big"]),
+            ('s', Field::Size, true, ["big", "linked", "small"]),
+            ('S', Field::Size, false, ["small", "linked", "big"]),
+        ];
+        for (k, by, descending, rows) in steps {
+            key(&mut v, KeyCode::Char(k));
+            assert_eq!(browse(&mut v).sort, Sort { by, descending });
+            assert_eq!(order(&mut v), rows, "{by:?}, descending {descending}");
+            assert_eq!(selected_name(&mut v), "linked", "selection kept");
+        }
+        // A click on a heading sorts by it, the next one turns it round; Usage is the size's.
+        text(&mut v, 120, 40);
+        let heads = v.hits.heads.clone();
+        assert_eq!(
+            heads.iter().map(|h| h.1).collect::<Vec<_>>(),
+            [Field::Name, Field::Size, Field::Size, Field::Modified],
+            "Name, Usage, Size, Modified (Items has no room)"
+        );
+        let (name, usage) = (heads[0].0, heads[1].0);
+        assert_eq!(v.hover_at(name.x + 1, name.y), Hover::Head(0));
+        click(&mut v, name.x + 1, name.y);
+        assert_eq!(browse(&mut v).sort, Sort::default().by(Field::Name));
+        assert!(has(&text(&mut v, 120, 40), "Name▴"));
+        click(&mut v, name.x + 1, name.y);
+        assert_eq!(order(&mut v), ["small", "linked", "big"]);
+        assert!(has(&text(&mut v, 120, 40), "Name▾"));
+        click(&mut v, usage.x + 1, usage.y);
+        assert_eq!(browse(&mut v).sort, Sort::default());
+        assert!(has(&text(&mut v, 120, 40), "Size▾"));
+        // The sort stays when the sizes switch to apparent ones; the map keeps its own order,
+        // largest first.
+        key(&mut v, KeyCode::Char('s'));
+        key(&mut v, KeyCode::Char('s'));
+        key(&mut v, KeyCode::Char('s'));
+        assert_eq!(order(&mut v), ["big", "linked", "small"], "by name");
+        key(&mut v, KeyCode::Char('a'));
+        assert_eq!(browse(&mut v).sort.by, Field::Name);
+        key(&mut v, KeyCode::Char('S'));
+        assert_eq!(order(&mut v), ["small", "linked", "big"]);
+        assert_eq!(tiles(&mut v, 120, 40).0, ["big", "linked", "small"]);
     }
 
     #[test]

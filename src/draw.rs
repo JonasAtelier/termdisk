@@ -16,7 +16,7 @@ use crate::style::{Colors, Glyphs};
 use crate::sys;
 use crate::tree::{Tree, HARDLINK_DUP, LINKED, MOUNT, NOT_OWNED, PROTECTED, UNREADABLE};
 use crate::treemap::{self, Item};
-use crate::view::{counted, Browse, Confirm, Hits, Hover, Panes, Screen, Start, View};
+use crate::view::{counted, Browse, Confirm, Field, Hits, Hover, Panes, Screen, Start, View};
 use crate::{fmt_size, Scan};
 
 /// The flags that keep an item from the trash, shown with a lock.
@@ -183,7 +183,7 @@ fn paint(v: &mut View, area: Rect, buf: &mut Buffer) {
             match items_fit {
                 true => hints.push_str("v panes  r rescan  q quit"),
                 false => hints.push_str(
-                    "o open  c copy  a size  t colours  v panes  r rescan  ? help  q quit",
+                    "o open  c copy  a size  t letters  v panes  r rescan  ? help  q quit",
                 ),
             }
             // Under the dialog nothing takes a click, so nothing there shows hover.
@@ -452,22 +452,55 @@ fn tree_pane(
     // (and their clicks) end before it.
     let bar_x = r.right() - 1;
     let r = Rect::new(r.x, r.y, r.width - 1, r.height);
-    // In a narrow pane columns go, Items first, so names keep 24 cells.
+    // A click on a heading sorts by it (Usage by size); the sorted one has an arrow.
+    let sort = b.sort;
+    let field = |title: &str| match title {
+        "Name" => Field::Name,
+        "Items" => Field::Items,
+        "Modified" => Field::Modified,
+        _ => Field::Size,
+    };
+    let sorted = |title: &str| title != "Usage" && field(title) == sort.by;
+    // In a narrow pane columns go, Items first, so names keep 24 cells; the sorted one stays
+    // while another can go, and goes too where it alone has no room. Usage is a percentage, a
+    // space and a bar of 8.
     let mut cols: Vec<(&str, u16)> =
-        vec![("Usage", 10), ("Size", 9), ("Items", 7), ("Modified", 10)];
+        vec![("Usage", 13), ("Size", 9), ("Items", 7), ("Modified", 10)];
+    let fits = |cols: &[(&str, u16)]| r.width >= 24 + cols.iter().map(|c| c.1 + 1).sum::<u16>();
     for drop in ["Items", "Modified", "Usage", "Size"] {
-        if r.width >= 24 + cols.iter().map(|c| c.1 + 1).sum::<u16>() {
+        if fits(&cols) {
             break;
         }
-        cols.retain(|c| c.0 != drop);
+        if !sorted(drop) {
+            cols.retain(|c| c.0 != drop);
+        }
+    }
+    if !fits(&cols) {
+        cols.clear();
     }
     let right: u16 = cols.iter().map(|c| c.1 + 1).sum();
     let name_w = r.width.saturating_sub(right);
-    put(buf, r.x + 1, r.y, "Name", name_w, head);
+    let mut heading = |title: &str, at: Rect, right_aligned: bool| {
+        let arrow = match sorted(title) {
+            true => g.sort[usize::from(sort.descending)],
+            false => "",
+        };
+        let t = match right_aligned {
+            true => format!("{:>w$}", format!("{title}{arrow}"), w = at.width as usize),
+            false => format!("{title}{arrow}"),
+        };
+        let st = match look.over(at) {
+            true => head.add_modifier(Modifier::UNDERLINED),
+            false => head,
+        };
+        put(buf, at.x, at.y, &t, at.width, st);
+        hits.heads.push((at, field(title)));
+    };
+    let name_at = Rect::new(r.x + 1, r.y, name_w.saturating_sub(1), 1);
+    heading("Name", name_at, false);
     let mut x = r.x + name_w;
     for (title, w) in &cols {
-        let t = format!("{title:>w$}", w = *w as usize);
-        put(buf, x + 1, r.y, &t, *w, head);
+        heading(title, Rect::new(x + 1, r.y, *w, 1), true);
         x += w + 1;
     }
     let rows = Rect::new(r.x, r.y + 1, r.width, r.height.saturating_sub(1));
@@ -555,7 +588,8 @@ fn tree_pane(
                 "Usage" => {
                     let total = parent.map_or(counted(n, apparent), |p| counted(&p, apparent));
                     let share = counted(n, apparent) as f64 / total.max(1) as f64;
-                    draw_bar(buf, x + 1, y, share, *w, style, look);
+                    put(buf, x + 1, y, &format!("{:>4}", percent(share)), 4, style);
+                    draw_bar(buf, x + 6, y, share, w - 5, style, look);
                 }
                 "Size" => {
                     let s = fmt_size(if apparent { n.apparent } else { n.alloc });
@@ -609,9 +643,12 @@ fn slider(track: u16, total: usize, view: usize, off: usize, max_off: usize) -> 
     (start.min(track - len), len)
 }
 
-/// The treemap, coloured by type or by age (`modes`: apparent sizes, by age), under a legend.
-/// Every tile shows its class as a letter too, and the selected one an outline (or the mark
-/// where it is too small for one): both inside the tile, so a click on them picks that tile.
+/// The treemap of the folder that holds the selected row (of the shown folder on its own row),
+/// largest first, under a legend: that folder's name and the classes on the map. The selected
+/// item's tile is blue, every other one in the next colour of `Colors::tiles` (`modes`: apparent
+/// sizes, the letters by age). Every tile shows its class as a letter too, and the selected one
+/// an outline (or the mark where it is too small for one): both inside the tile, so a click on
+/// them picks that tile.
 fn map_pane(
     b: &mut Browse,
     (apparent, by_age): (bool, bool),
@@ -621,20 +658,22 @@ fn map_pane(
     look: &Look,
 ) {
     let (c, g) = (&look.c, look.g);
-    let zoom = b.zoom;
-    let kids = b.kids(zoom).to_vec();
+    let (folder, selected) = b.map_of();
+    let kids = b.kids(folder).to_vec();
     let sizes: Vec<u64> = kids
         .iter()
         .map(|&k| counted(b.tree.node(k), apparent))
         .collect();
-    let selected = b.tile_of(b.rows[b.cursor].0);
+    let selected = selected.and_then(|s| kids.iter().position(|&k| k == s));
+    // The "+N items" tile holds the N smallest items that are not empty (the last ones).
+    let not_empty = sizes.iter().filter(|&&s| s > 0).count();
     let (legend, r) = match r.height >= 3 {
         true => (Some(r.y), Rect::new(r.x, r.y + 1, r.width, r.height - 1)),
         false => (None, r),
     };
-    let (classes, colours): (&[(&str, &str)], &[Color]) = match by_age {
-        true => (&AGES, &c.ages),
-        false => (&KINDS, &c.kinds),
+    let classes: &[(&str, &str)] = match by_age {
+        true => &AGES,
+        false => &KINDS,
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -670,14 +709,18 @@ fn map_pane(
             }
             Item::Rest(count) => (None, format!("+{count} items"), String::new(), None),
         };
-        let chosen = id.is_some() && id == selected;
-        let mut style = match class {
-            Some(k) => Style::new().bg(colours[k]).fg(c.tile_fg),
-            None => Style::new().bg(c.rest_bg).fg(c.rest_fg),
+        let chosen = selected.is_some_and(|s| match t.item {
+            Item::One(k) => k == s,
+            Item::Rest(count) => s < not_empty && s + count >= not_empty,
+        });
+        let style = match (chosen, t.item) {
+            (true, _) => Style::new()
+                .bg(c.sel_tile)
+                .fg(c.tile_fg)
+                .add_modifier(Modifier::BOLD),
+            (false, Item::One(k)) => Style::new().bg(c.tiles[k % c.tiles.len()]).fg(c.tile_fg),
+            (false, Item::Rest(_)) => Style::new().bg(c.rest_bg).fg(c.rest_fg),
         };
-        if chosen {
-            style = style.add_modifier(Modifier::BOLD);
-        }
         buf.set_style(fill, style);
         let outlined = chosen && fill.width >= 4 && fill.height >= 3;
         if outlined {
@@ -707,10 +750,19 @@ fn map_pane(
         }
         hits.tiles.push((rect, id));
     }
-    // The legend: the classes on the map, each letter on its colour; where a name has no room,
-    // the letter alone (the keys, `?`, list them all).
+    // The legend: the folder on the map (a third of the line at most), then the classes on it,
+    // each by its letter; where a name has no room, the letter alone (the keys, `?`, list them
+    // all).
     let Some(y) = legend else { return };
-    let mut x = r.x + 1;
+    let mut name = name_of(b, folder);
+    if folder != 0 {
+        name.push('/');
+    }
+    let name = fit_middle(&name, (r.width / 3) as usize, g.cut);
+    let bold = look.on(c.bg).add_modifier(Modifier::BOLD);
+    let label = format!("{name} {}", g.dot);
+    put(buf, r.x + 1, y, &label, r.width, bold);
+    let mut x = r.x + 1 + width(&label) as u16 + 1;
     for (k, &(letter, name)) in classes.iter().enumerate() {
         if !shown[k] {
             continue;
@@ -720,11 +772,7 @@ fn map_pane(
         if x + w > r.right() {
             break;
         }
-        let swatch = Style::new()
-            .bg(colours[k])
-            .fg(c.tile_fg)
-            .add_modifier(Modifier::BOLD);
-        put(buf, x, y, letter, 1, swatch);
+        put(buf, x, y, letter, 1, bold);
         if w > 1 {
             put(buf, x + 2, y, name, w - 2, look.on(c.bg).fg(c.dim));
         }
@@ -877,7 +925,7 @@ fn help(area: Rect, buf: &mut Buffer, look: &Look) {
         format!("{up_down}  PgUp PgDn"),
         format!("{right_left}  + -"),
     );
-    let keys: [(&str, &str); 19] = [
+    let keys: [(&str, &str); 20] = [
         (&moves, "move"),
         (&opens, "open, close a folder"),
         ("double click (tree)", "open, close a folder"),
@@ -887,11 +935,12 @@ fn help(area: Rect, buf: &mut Buffer, look: &Look) {
         ("o", "open with the default program"),
         ("c", "copy the path"),
         ("a", "disk usage / apparent size"),
-        ("t", "map colours: by type / by age"),
+        ("t", "map letters: by type / by age"),
+        ("s, S", "sort the tree: next column / reverse"),
         ("v", "tree and map / tree / map"),
         ("r", "scan again"),
         ("Esc", "stop a scan, close a dialog"),
-        ("click", "select (tree or map)"),
+        ("click", "select (tree or map), sort (heading)"),
         ("?", "this help"),
         ("q", "quit"),
         // The map's letters, all of them (its legend shows those on it, as room allows).
@@ -1078,6 +1127,21 @@ fn bar(share: f64, w: u16, g: &Glyphs) -> (String, String) {
     (fill, rest)
 }
 
+/// A share (0 to 1) as a whole percentage: "0%" for nothing, "<1%" for less than half of one,
+/// ">99%" for nearly all, so only all of it is "100%".
+fn percent(share: f64) -> String {
+    let share = share.clamp(0.0, 1.0);
+    if share <= 0.0 {
+        "0%".into()
+    } else if share < 0.005 {
+        "<1%".into()
+    } else if (0.995..1.0).contains(&share) {
+        ">99%".into()
+    } else {
+        format!("{}%", (share * 100.0).round() as u32)
+    }
+}
+
 /// A bar at (x, y) on `style`'s background: the filled part in the bar colour, the track dim.
 fn draw_bar(buf: &mut Buffer, x: u16, y: u16, share: f64, w: u16, style: Style, look: &Look) {
     let (fill, rest) = bar(share, w, look.g);
@@ -1131,6 +1195,15 @@ mod tests {
         assert_eq!(bar(0.3, 5, ascii), ("=-".to_string(), "   ".to_string()));
         let (f, r) = bar(0.33, 10, unicode);
         assert_eq!(width(&f) + width(&r), 10);
+    }
+
+    #[test]
+    fn shares_show_as_whole_percentages() {
+        let p = [0.0, 0.0049, 0.005, 0.07, 0.42, 0.994, 0.995, 0.9999, 1.0].map(percent);
+        let want = [
+            "0%", "<1%", "1%", "7%", "42%", "99%", ">99%", ">99%", "100%",
+        ];
+        assert_eq!(p, want);
     }
 
     #[test]

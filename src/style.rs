@@ -59,11 +59,10 @@ pub struct Colors {
     pub button2_bg: Color,
     pub button2_fg: Color,
     pub disabled: Color,
-    /// Treemap tiles by kind (folder, video, image, audio, archive, document, code and text,
-    /// other) and by age (this week, month, year, older); white text on them; the tile of the
-    /// items too small for their own.
-    pub kinds: [Color; 8],
-    pub ages: [Color; 4],
+    /// Treemap tiles, each in the next of these (none blue), and the selected one; white text on
+    /// them; the tile of the items too small for their own.
+    pub tiles: [Color; 8],
+    pub sel_tile: Color,
     pub tile_fg: Color,
     pub rest_bg: Color,
     pub rest_fg: Color,
@@ -110,23 +109,20 @@ impl Default for Colors {
             button2_bg: rgb(0x2A2D2E),
             button2_fg: rgb(0xCCCCCC),
             disabled: rgb(0x797979), // foreground at 0.5 over the widget
-            // From xterm's 256 colours, muted enough for white text.
-            kinds: [
-                rgb(0x005F87), // folder
-                rgb(0x87005F), // video
-                rgb(0x00875F), // image
-                rgb(0x875F00), // audio
-                rgb(0x5F5F00), // archive
-                rgb(0x5F0087), // document
-                rgb(0x005F5F), // code and text
-                rgb(0x5F5F87), // other
+            // From xterm's 256 colours, muted enough for white text. Blue is in none (nor
+            // violet), so the selected tile is the only blue one; neighbours differ in 16
+            // colours too (red, green, red, grey, cyan, red, green, magenta).
+            tiles: [
+                rgb(0x87005F),
+                rgb(0x00875F),
+                rgb(0x870000),
+                rgb(0x875F5F),
+                rgb(0x008787),
+                rgb(0xAF5F00),
+                rgb(0x5F8700),
+                rgb(0x870087),
             ],
-            ages: [
-                rgb(0x00875F), // this week
-                rgb(0x5F8700), // this month
-                rgb(0x875F00), // this year
-                rgb(0x5F5F5F), // older
-            ],
+            sel_tile: rgb(0x005FD7), // xterm's 26: blue in 16 colours too
             tile_fg: rgb(0xFFFFFF),
             rest_bg: rgb(0x3C3C3C),
             rest_fg: rgb(0xCCCCCC),
@@ -174,8 +170,8 @@ impl Colors {
             button2_bg: f(self.button2_bg),
             button2_fg: f(self.button2_fg),
             disabled: f(self.disabled),
-            kinds: self.kinds.map(f),
-            ages: self.ages.map(f),
+            tiles: self.tiles.map(f),
+            sel_tile: f(self.sel_tile),
             tile_fg: f(self.tile_fg),
             rest_bg: f(self.rest_bg),
             rest_fg: f(self.rest_fg),
@@ -277,6 +273,8 @@ pub(crate) struct Glyphs {
     /// The tree's scrollbar; a done message.
     pub slider: &'static str,
     pub check: &'static str,
+    /// After the heading the tree is sorted by: ascending, descending.
+    pub sort: [&'static str; 2],
 }
 
 const NERD: Glyphs = Glyphs {
@@ -307,6 +305,8 @@ const UNICODE: Glyphs = Glyphs {
     spin: &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
     slider: "┃",
     check: "✓",
+    // Not ▲▼: those are two cells wide where East Asian ambiguous widths are wide.
+    sort: ["▴", "▾"],
 };
 
 const ASCII: Glyphs = Glyphs {
@@ -326,6 +326,7 @@ const ASCII: Glyphs = Glyphs {
     spin: &["|", "/", "-", "\\"],
     slider: "|",
     check: "+",
+    sort: ["^", "v"],
 };
 
 impl IconSet {
@@ -358,7 +359,7 @@ mod tests {
         assert_eq!((c16.sel_bg, c16.side_bg), (Color::Black, Color::Black));
         let all = |c: &Colors| {
             [
-                c.bg, c.fg, c.sel_bg, c.focus, c.disabled, c.kinds[3], c.ages[0], c.hover_bg,
+                c.bg, c.fg, c.sel_bg, c.focus, c.disabled, c.tiles[3], c.sel_tile, c.hover_bg,
                 c.slider,
             ]
         };
@@ -366,6 +367,35 @@ mod tests {
         assert!(all(&c16)
             .iter()
             .all(|c| !matches!(c, Color::Rgb(..) | Color::Indexed(_))));
+    }
+
+    #[test]
+    fn tiles_differ_from_their_neighbours_and_only_the_selected_one_is_blue() {
+        for d in [Depth::True, Depth::C256, Depth::C16] {
+            let c = Colors::default().fitted(d);
+            let n = c.tiles.len();
+            for i in 0..n {
+                // The colours go round: the last one is next to the first.
+                assert_ne!(c.tiles[i], c.tiles[(i + 1) % n], "{d:?}: {i}");
+                assert_ne!(c.tiles[i], c.sel_tile, "{d:?}: {i}");
+                assert_ne!(c.tiles[i], c.rest_bg, "{d:?}: {i}");
+            }
+        }
+        let (c256, c16) = (
+            Colors::default().fitted(Depth::C256),
+            Colors::default().fitted(Depth::C16),
+        );
+        assert_eq!(c256.sel_tile, Color::Indexed(26));
+        assert_eq!(c16.sel_tile, Color::Blue);
+        let blue = [Color::Blue, Color::LightBlue];
+        assert!(!c16.tiles.iter().any(|t| blue.contains(t)));
+        // Nor bluish in true colour: blue is never the strongest part (violet would be).
+        for t in Colors::default().tiles {
+            let Color::Rgb(r, g, b) = t else {
+                panic!("{t:?}")
+            };
+            assert!(b <= r.max(g), "{t:?}");
+        }
     }
 
     #[test]
@@ -379,7 +409,11 @@ mod tests {
             let none_or_one = [g.folder, g.folder_open, g.file];
             assert!(none_or_one.iter().all(|s| s.width() <= 1), "{set:?}");
             assert!(
-                g.border.iter().chain(&g.bar).all(|s| s.width() == 1),
+                g.border
+                    .iter()
+                    .chain(&g.bar)
+                    .chain(&g.sort)
+                    .all(|s| s.width() == 1),
                 "{set:?}"
             );
         }
@@ -393,6 +427,7 @@ mod tests {
             .chain(&a.border)
             .chain(&a.bar)
             .chain(&a.keys)
+            .chain(&a.sort)
             .all(|s| s.is_ascii()));
     }
 }
