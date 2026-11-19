@@ -56,8 +56,8 @@ the same from the keyboard. Folders stay on top either way. Names go A to Z (cap
 small letters together), sizes, item counts and changes largest or newest first, and the
 heading sorted by has an arrow. Each level of the tree has a guide line, and guides, chevrons
 and folder icons are coloured by level (gold, orchid, blue in turn). The right pane is a
-treemap of the folder that holds the selected row (on the shown folder's own row, of that
-folder), always largest first: moving down into an open folder shows that folder's map.
+treemap of the folder that holds the selected row, that row's tile in blue; on an open
+folder's row (the shown folder's too), of that folder itself. Always largest first.
 Selecting in one pane selects in the other. Folders in the tree start closed.
 
 | Key | |
@@ -133,7 +133,7 @@ seconds.
   is a tmpfs, other disks).
 - Caches kept under `~/.config`, `~/.local` and `~/.var` (Electron and Flatpak programs) are
   inside protected folders and cannot be moved.
-- The treemap shows one level: the folder of the selected row.
+- The treemap shows one level: the open folder selected, else the folder of the selected row.
 
 ## Look
 

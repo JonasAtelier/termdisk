@@ -19,8 +19,8 @@ What changed in each termdisk release, newest first. The version rule is in `AGE
 - The Usage column shows the share of its folder as a percentage before the bar ("41%";
   "<1%" below half a percent, ">99%" for nearly all, "100%" only for all); the bar is 8 cells.
   A narrow tree keeps the column it is sorted by.
-- The map follows the selection: it shows the folder that holds the selected row (on the
-  shown folder's own row, that folder), so moving down into an open folder shows its map. Its
+- The map follows the selection: it shows the folder that holds the selected row, that row's
+  tile selected; on an open folder's row (the shown folder's too), that folder's items. Its
   legend starts with that folder's name. The map stays largest first whatever the tree's order.
 - The map's tiles take 8 colours in turn, so neighbouring tiles differ, and only the selected
   tile is blue, also in 256 and 16 colours (the "+N items" tile when the selected item is among

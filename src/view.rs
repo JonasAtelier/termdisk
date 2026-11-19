@@ -882,9 +882,13 @@ impl Browse {
     }
 
     /// The treemap's folder and its selected tile: the folder that holds the selected row, and
-    /// that row's item; on the shown folder's own row, that folder and no tile.
+    /// that row's item; on an open folder's row (the shown folder's too), that folder and no
+    /// tile, so opening a folder shows what is in it.
     pub fn map_of(&self) -> (NodeId, Option<NodeId>) {
         let sel = self.rows[self.cursor].0;
+        if self.open.contains(&sel) {
+            return (sel, None);
+        }
         match self.tree.parent(sel).filter(|_| sel != self.zoom) {
             Some(p) => (p, Some(sel)),
             None => (self.zoom, None),
@@ -1936,9 +1940,19 @@ mod tests {
         assert!(browse(&mut v).open.contains(&big) && row_shown(&mut v, "inner"));
         assert!(has(&text(&mut v, 120, 40), "▾ big/"));
         assert_eq!(selected_name(&mut v), "big");
+        assert_eq!(
+            browse(&mut v).map_of(),
+            (big, None),
+            "an open folder maps its own items"
+        );
         click(&mut v, x, y);
         click(&mut v, x, y);
         assert!(!browse(&mut v).open.contains(&big) && !row_shown(&mut v, "inner"));
+        assert_eq!(
+            browse(&mut v).map_of(),
+            (0, Some(big)),
+            "closed, the folder above again"
+        );
         assert_eq!(selected_name(&mut v), "big");
         // Enter still shows that folder, Backspace the one above.
         key(&mut v, KeyCode::Enter);
@@ -1947,7 +1961,8 @@ mod tests {
         key(&mut v, KeyCode::Backspace);
         assert_eq!(browse(&mut v).zoom, 0);
         assert_eq!(selected_name(&mut v), "big");
-        // A double click on a tile still shows that folder.
+        // A double click on a tile still shows that folder (big closed, so it is a tile).
+        key(&mut v, KeyCode::Left);
         text(&mut v, 120, 40);
         let tile = v.hits.tiles.iter().find(|t| t.1 == Some(big)).unwrap().0;
         click(&mut v, tile.x, tile.y);
