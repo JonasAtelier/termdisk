@@ -4,6 +4,36 @@ A disk usage analyzer for the terminal, in pure Rust: the terminal counterpart o
 Disk Usage Analyzer (baobab), with its treemap, made for finding what is big and clearing
 caches and temporary files.
 
+```
+                 ~/Downloads  —  4.4 MB (disk usage)  —  termdisk
+ Name                       Usage      Size   Modified   V video I image A audio Z archive D doc T text O other
+ ▾ Downloads/ ⊘        ━━━━━━━━━━    4.4 MB 2026-11-19  ╭Z linux.iso────────────────────────────────────────╮
+▌    ▪ linux.iso       ━━━━──────    1.8 MB 2025-10-15  │1.8 MB                                             │
+     ▪ clip.mkv        ━━────────  901.1 kB 2026-11-17  │                                                   │
+     ▪ photo.jpg       ━╸────────  602.1 kB 2026-11-04  ╰───────────────────────────────────────────────────╯
+     ▪ song.mp3        ━─────────  450.6 kB 2026-08-11   V clip.mkv                   A song.mp3
+     ▪ notes.pdf       ╸─────────  303.1 kB 2024-09-10   901.1 kB                     450.6 kB
+     ▪ script.py       ╸─────────  122.9 kB 2026-11-18   I photo.jpg                  D notes.pdf   T scrip…
+ ↑↓ move  →← open  Enter zoom  ⌫ up  Del trash  v panes  r rescan  q quit       a: disk usage  t: by type  ?: keys
+```
+
+(A sketch of the view without its colours.)
+
+- Fast: a home folder of 2 million entries scans in about half a second (see Speed).
+- A folder tree and a treemap side by side, keyboard and mouse.
+- Careful: it only ever moves things to the trash, and refuses what you would miss
+  (see what it refuses, below).
+- A library without terminal code, so another program can embed the view.
+
+## Install
+
+```
+cargo install --git https://github.com/JonasAtelier/termdisk --locked
+```
+
+Needs Linux and Rust 1.93 or newer. Moving to the trash needs Linux 5.8 or newer (on an
+older kernel termdisk only looks). A Nerd Font and a mouse are used when there, not needed.
+
 ## Use
 
 ```
@@ -63,6 +93,32 @@ another filesystem than the trash (where `/tmp` is a tmpfs, that includes `/tmp`
 more, list paths in `~/.config/termdisk/protect`, one per line (absolute or `~/...`). It does
 nothing at all when run as root or setuid.
 
+## Speed
+
+Measured on one 12-thread machine with a warm cache, on a home folder of 2.05 million
+entries (`scripts/bench.sh` repeats it):
+
+| | Time | Max memory |
+|---|---|---|
+| `termdisk --summary` | 0.47 s | 155 MB |
+| `ncdu -x -0 -o /dev/null` (1.22) | 2.50 s | — (it keeps no tree) |
+| `du -sx` | 3.31 s | 209 MB |
+
+The view is up when the scan ends, draws a 300×80 screen in under 0.4 ms, and does nothing
+at all while nothing happens. With a cold cache the disk sets the pace: the same scan takes
+seconds.
+
+## Limits
+
+- Linux only.
+- No permanent delete and no "empty the trash": free the space from the file manager or
+  with `gio trash --empty`.
+- What is on another filesystem than your trash can be looked at, not moved (`/tmp` where it
+  is a tmpfs, other disks).
+- Caches kept under `~/.config`, `~/.local` and `~/.var` (Electron and Flatpak programs) are
+  inside protected folders and cannot be moved.
+- The treemap shows one level: the folder shown.
+
 ## Look
 
 termdisk looks like termcode: its default colours (VS Code's dark theme) and its three icon
@@ -86,4 +142,12 @@ termcode (MIT, the same author).
 
 ```
 cargo build --release   # Rust 1.93 or newer
+cargo test
 ```
+
+`AGENTS.md` describes the source files, the checks and the version rule; `CHANGELOG.md` what
+changed in each version.
+
+## License
+
+MIT, see `LICENSE`.
