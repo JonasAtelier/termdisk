@@ -521,10 +521,11 @@ fn dialog(
 }
 
 fn help(area: Rect, buf: &mut Buffer) {
-    const KEYS: [(&str, &str); 14] = [
+    const KEYS: [(&str, &str); 15] = [
         ("↑ ↓  PgUp PgDn", "move"),
         ("→ ←  + -", "open, close a folder"),
-        ("Enter, double click", "show that folder"),
+        ("double click (tree)", "open, close a folder"),
+        ("Enter, double click (map)", "show that folder"),
         ("Backspace", "show the folder above"),
         ("Del", "move to the trash (asks first)"),
         ("o", "open with the default program"),
@@ -537,7 +538,7 @@ fn help(area: Rect, buf: &mut Buffer) {
         ("?", "this help"),
         ("q", "quit"),
     ];
-    let w = area.width.saturating_sub(4).min(58);
+    let w = area.width.saturating_sub(4).min(64);
     let h = (KEYS.len() as u16 + 4).min(area.height);
     let r = Rect::new(
         area.x + (area.width - w) / 2,
@@ -548,7 +549,7 @@ fn help(area: Rect, buf: &mut Buffer) {
     let style = Style::default().bg(Color::Indexed(235)).fg(Color::White);
     frame(r, " Keys ", style, buf);
     for (i, (k, what)) in KEYS.iter().enumerate().take(h.saturating_sub(4) as usize) {
-        let line = format!("{k:<22}{what}");
+        let line = format!("{k:<27}{what}");
         put(
             buf,
             r.x + 2,

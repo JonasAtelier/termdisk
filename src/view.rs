@@ -511,7 +511,8 @@ impl View {
         let double = self
             .last_click
             .is_some_and(|(t, cx, cy)| now - t < DOUBLE && (cx, cy) == (x, y));
-        self.last_click = Some((now, x, y));
+        // A double click is used up: a third quick click starts over as a single one.
+        self.last_click = if double { None } else { Some((now, x, y)) };
         if self.help {
             self.help = false;
             return Outcome::Redraw;
@@ -546,7 +547,7 @@ impl View {
                 if row < b.rows.len() {
                     b.cursor = row;
                     if double {
-                        b.zoom_in(b.rows[row].0);
+                        b.toggle(b.rows[row].0);
                     }
                 }
             }
@@ -617,12 +618,28 @@ impl Browse {
             }
         }
         self.rows = rows;
-        if let Some(k) = keep {
+        // On `keep`, or, if a folder above it was closed, on the nearest one still shown.
+        let mut keep = keep;
+        while let Some(k) = keep {
             if let Some(i) = self.rows.iter().position(|r| r.0 == k) {
                 self.cursor = i;
+                break;
             }
+            keep = self.tree.parent(k);
         }
         self.cursor = self.cursor.min(self.rows.len() - 1);
+    }
+
+    /// Opens or closes the folder `id` in place. The shown folder is always open, and a file
+    /// has nothing to open: both stay as they are.
+    fn toggle(&mut self, id: NodeId) {
+        if id == self.zoom || !self.tree.node(id).is_dir() {
+            return;
+        }
+        if !self.open.remove(&id) {
+            self.open.insert(id);
+        }
+        self.rebuild(Some(id));
     }
 
     /// Puts the cursor on `id`, opening the folders above it as needed.
@@ -1131,8 +1148,42 @@ mod tests {
         assert!(has(&text(&mut v, 120, 40), "may free nothing"));
     }
 
+    /// The cell of the tree row named `name`, as drawn at 120x40.
+    fn cell_of(v: &mut View, name: &str) -> (u16, u16) {
+        text(v, 120, 40);
+        let rows = v.hits.rows;
+        let b = browse(v);
+        let i = b
+            .rows
+            .iter()
+            .position(|r| b.tree.name(r.0) == name)
+            .unwrap();
+        (rows.x + 3, rows.y + (i - b.top) as u16)
+    }
+
+    /// Whether a row named `name` is in the tree pane.
+    fn row_shown(v: &mut View, name: &str) -> bool {
+        let b = browse(v);
+        b.rows.iter().any(|r| b.tree.name(r.0) == name)
+    }
+
     #[test]
-    fn tree_and_map_select_each_other_and_double_click_zooms() {
+    fn folders_start_closed() {
+        let (_t, home) = home("view-closed");
+        let mut v = ready(policy(&home, None), &home);
+        let b = browse(&mut v);
+        assert_eq!(b.open, HashSet::from([0]), "only the shown folder is open");
+        assert!(b
+            .rows
+            .iter()
+            .all(|r| (r.1 == 0) == (r.0 == b.zoom) && r.1 <= 1));
+        assert!(row_shown(&mut v, ".cache") && !row_shown(&mut v, "big"));
+        let lines = text(&mut v, 120, 40);
+        assert!(has(&lines, "▸ .cache/") && !has(&lines, "big/"));
+    }
+
+    #[test]
+    fn tree_and_map_select_each_other_and_a_double_click_opens_and_closes() {
         let (_t, home) = home("view-mouse");
         let mut v = ready(policy(&home, None), &home.join(".cache"));
         text(&mut v, 120, 40);
@@ -1147,18 +1198,126 @@ mod tests {
         let b = browse(&mut v);
         let big = b.rows[b.cursor].0;
         assert_eq!(b.tile_of(big), Some(big), "the row selects its tile");
-        // Double click on the "big" row: its contents fill the view.
-        text(&mut v, 120, 40);
-        let row = v.hits.rows;
-        let b = browse(&mut v);
-        let y = row.y + (b.cursor - b.top) as u16;
-        click(&mut v, row.x + 3, y);
-        click(&mut v, row.x + 3, y);
+        // A double click on the "big" row opens it where it is; another closes it.
+        let (x, y) = cell_of(&mut v, "big");
+        click(&mut v, x, y);
+        click(&mut v, x, y);
+        assert_eq!(browse(&mut v).zoom, 0, "the shown folder stays");
+        assert!(browse(&mut v).open.contains(&big) && row_shown(&mut v, "inner"));
+        assert!(has(&text(&mut v, 120, 40), "▾ big/"));
+        assert_eq!(selected_name(&mut v), "big");
+        click(&mut v, x, y);
+        click(&mut v, x, y);
+        assert!(!browse(&mut v).open.contains(&big) && !row_shown(&mut v, "inner"));
+        assert_eq!(selected_name(&mut v), "big");
+        // Enter still shows that folder, Backspace the one above.
+        key(&mut v, KeyCode::Enter);
         assert_eq!(browse(&mut v).zoom, big);
         assert_eq!(selected_name(&mut v), "inner");
         key(&mut v, KeyCode::Backspace);
         assert_eq!(browse(&mut v).zoom, 0);
         assert_eq!(selected_name(&mut v), "big");
+        // A double click on a tile still shows that folder.
+        text(&mut v, 120, 40);
+        let tile = v.hits.tiles.iter().find(|t| t.1 == Some(big)).unwrap().0;
+        click(&mut v, tile.x, tile.y);
+        click(&mut v, tile.x, tile.y);
+        assert_eq!(browse(&mut v).zoom, big);
+    }
+
+    #[test]
+    fn a_double_click_on_a_file_or_on_the_shown_folder_changes_nothing() {
+        let (_t, home) = home("view-dbl-file");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        let rows = browse(&mut v).rows.clone();
+        for name in ["small", ".cache"] {
+            let name = if name == ".cache" {
+                home.join(".cache").display().to_string() // the shown folder's row: its path
+            } else {
+                name.to_string()
+            };
+            let (x, y) = cell_of(&mut v, &name);
+            click(&mut v, x, y);
+            click(&mut v, x, y);
+            let b = browse(&mut v);
+            assert_eq!((b.rows.clone(), b.zoom), (rows.clone(), 0), "{name}");
+            assert_eq!(b.open, HashSet::from([0]));
+        }
+    }
+
+    #[test]
+    fn a_triple_click_opens_once_on_the_row_clicked() {
+        let (_t, home) = home("view-triple");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        let (x, y) = cell_of(&mut v, "big");
+        for _ in 0..3 {
+            click(&mut v, x, y);
+        }
+        assert!(
+            row_shown(&mut v, "inner"),
+            "opened by the double click, not closed again"
+        );
+        assert_eq!(
+            selected_name(&mut v),
+            "big",
+            "the third click selects the same row"
+        );
+    }
+
+    #[test]
+    fn closing_a_folder_brings_the_selection_up_to_it() {
+        let (_t, home) = home("view-close-sel");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        let b = browse(&mut v);
+        let (big, f0) = (
+            b.tree.find(&home.join(".cache/big")).unwrap(),
+            b.tree.find(&home.join(".cache/big/inner/f0")).unwrap(),
+        );
+        b.select(f0); // opens big and inner
+        assert_eq!(selected_name(&mut v), "f0");
+        let b = browse(&mut v);
+        b.open.remove(&big);
+        b.rebuild(Some(f0));
+        assert_eq!(selected_name(&mut v), "big", "not a row that is gone");
+        assert_eq!(browse(&mut v).tile_of(big), Some(big), "the map follows");
+        // The same through the mouse: the click lands on big first, the double click closes it.
+        browse(&mut v).select(f0);
+        let (x, y) = cell_of(&mut v, "big");
+        click(&mut v, x, y);
+        click(&mut v, x, y);
+        assert_eq!(selected_name(&mut v), "big");
+        assert!(!row_shown(&mut v, "f0"));
+    }
+
+    #[test]
+    fn an_open_folder_stays_open_after_a_trash_inside_it_and_closes_on_rescan() {
+        let (_t, home) = home("view-open-trash");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        let inner = browse(&mut v)
+            .tree
+            .find(&home.join(".cache/big/inner"))
+            .unwrap();
+        browse(&mut v).select(inner);
+        key(&mut v, KeyCode::Delete);
+        age(&mut v);
+        key(&mut v, KeyCode::Tab);
+        browse(&mut v).confirm.as_mut().unwrap().focused -= REFOCUS;
+        key(&mut v, KeyCode::Enter);
+        assert!(!home.join(".cache/big/inner").exists());
+        assert!(has(&text(&mut v, 120, 40), "▾ big/"), "still open");
+        assert!(!row_shown(&mut v, "inner"));
+        let b = browse(&mut v);
+        assert!(b.tree.node(b.rows[b.cursor].0).flags & TRASHED == 0);
+        // A rescan builds a new tree: folders start closed again.
+        key(&mut v, KeyCode::Char('r'));
+        for _ in 0..5000 {
+            v.tick();
+            if matches!(v.screen, Screen::Browse(_)) {
+                break;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        assert_eq!(browse(&mut v).open, HashSet::from([0]));
     }
 
     #[test]
