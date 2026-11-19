@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use termdisk::{treemap, NodeId, Policy, Tree, View};
 
@@ -19,6 +20,19 @@ fn median(mut f: impl FnMut()) -> Duration {
         .collect();
     t.sort();
     t[25]
+}
+
+/// The pointer moved to a new cell (across rows and tiles), then the whole view drawn.
+fn move_and_draw(view: &mut View, buf: &mut Buffer, at: &mut u16) {
+    let a = buf.area;
+    *at = at.wrapping_add(7);
+    view.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: *at % a.width,
+        row: 1 + *at % (a.height - 2),
+        modifiers: KeyModifiers::NONE,
+    });
+    view.draw(a, buf);
 }
 
 /// The children's sizes of `id`, largest first, as the view lays them out.
@@ -46,8 +60,8 @@ fn main() {
         tree.children(0).len(),
         tree.children(widest).len()
     );
-    println!("| size | layout, root | layout, widest folder | full draw |");
-    println!("|---|---|---|---|");
+    println!("| size | layout, root | layout, widest folder | full draw | pointer moving | by age, pointer moving |");
+    println!("|---|---|---|---|---|---|");
     for (w, h) in [(120, 40), (300, 80)] {
         let map = Rect::new(61, 1, w - 61, h - 2);
         let (root, wide) = (sizes(&tree, 0), sizes(&tree, widest));
@@ -56,6 +70,14 @@ fn main() {
         let area = Rect::new(0, 0, w, h);
         let mut buf = Buffer::empty(area);
         let draw = median(|| view.draw(area, &mut buf));
-        println!("| {w}x{h} | {l_root:.1?} | {l_wide:.1?} | {draw:.1?} |");
+        let mut at = 0;
+        let hover = median(|| move_and_draw(&mut view, &mut buf, &mut at));
+        let t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE);
+        view.handle_key(t);
+        let by_age = median(|| move_and_draw(&mut view, &mut buf, &mut at));
+        view.handle_key(t);
+        println!(
+            "| {w}x{h} | {l_root:.1?} | {l_wide:.1?} | {draw:.1?} | {hover:.1?} | {by_age:.1?} |"
+        );
     }
 }
