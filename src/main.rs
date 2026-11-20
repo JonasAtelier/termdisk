@@ -38,7 +38,22 @@ const ICONS_WAIT: Duration = Duration::from_secs(2);
 /// How often the loop looks for the detection's answer while it is out.
 const ICONS_CHECK: Duration = Duration::from_millis(15);
 
+/// glibc maps blocks from 128 KiB up on their own, so freeing them gives the memory back, but
+/// raises that limit to the size of each one freed (up to 32 MiB). Once a tree's 20 MB of names
+/// is freed (a scan again drops the last tree), the next tree grows inside the heap, copied at
+/// each step and kept there: a scan again peaked 40 MB above the first. A fixed limit keeps the
+/// peak and the memory after it where the first scan left them. The program's own setting, not
+/// the library's: a host such as termcode keeps its own.
+fn keep_large_blocks_mapped() {
+    // SAFETY: mallopt only changes when malloc maps a block; called before any thread starts.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 128 * 1024);
+    }
+}
+
 fn main() -> ExitCode {
+    keep_large_blocks_mapped();
     let (mut summary, mut read_only, mut path) = (false, false, None);
     for a in std::env::args_os().skip(1) {
         match a.to_str() {
@@ -409,7 +424,8 @@ fn print_summary(path: &Path) -> ExitCode {
     let dirs = (1..tree.len() as NodeId)
         .filter(|&i| tree.node(i).is_dir())
         .count();
-    // A mount point is a MOUNT folder the scan did not enter; its ancestors have children.
+    // MOUNT marks the mount points themselves (the folders above one hold it: HOLDS); the scan
+    // did not enter them, so they have no children.
     let mounts = (1..tree.len() as NodeId)
         .filter(|&i| tree.node(i).flags & MOUNT != 0 && tree.children(i).is_empty())
         .count();
@@ -423,7 +439,8 @@ fn print_summary(path: &Path) -> ExitCode {
     );
     println!(
         "items       {} ({dirs} folders, {mounts} mount points not entered, {} unreadable)",
-        r.items, tree.errors
+        tree.items(tree.root()),
+        tree.errors
     );
     println!("time        {secs:.3} s");
     println!(

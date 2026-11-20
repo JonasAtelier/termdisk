@@ -15,7 +15,10 @@
 # folders included; uutils du counts folders as 0 with -b), and
 # bytes per entry: the tree's own count and (max RSS - max RSS on an empty folder) / entries.
 # Then the view (`--read-only` on DIR, in scripts/smoke.py's pty): launch to the first frame
-# of the scanned tree, max RSS, threads after the scan, wake-ups over 5 idle seconds; frame
+# of the scanned tree, max RSS, threads after the scan, wake-ups over 5 idle seconds; its
+# memory after the scan, how long a scan again (`r`) takes to its tree, the memory then and
+# the max RSS over both (a binary that kept its last tree on screen meanwhile, before 0.4.0's
+# scan card, never redraws the headings: that wait ends after 60 s); frame
 # times (target/release/examples/frame: treemap layout and full draw, 120x40 and 300x80); and
 # the trash of a 10 000-file folder in smoke.py's temporary home, confirm to updated screen.
 set -u
@@ -108,6 +111,12 @@ echo "view on $DIR (--read-only):"
 # Half a second before counting: the first frame may still be on its way to the pty.
 python3 -I scripts/smoke.py "$BIN" 'waitfor:Modified,sleep:0.5,threads,ctx:5,key:q' --read-only "$DIR" |
   grep -E '^(waitfor|threads|wake-ups|max RSS|exit|restored)' | sed 's/^waitfor .Modified.:/launch to first frame:/'
+echo
+echo "scan again (r) in the view on $DIR (--read-only):"
+# The headings come back once the new tree replaces the scan's card.
+python3 -I scripts/smoke.py "$BIN" 'waitfor:Modified,sleep:0.5,rss,mark,key:r,waitfor:Modified,sleep:0.5,rss,key:q' --read-only "$DIR" |
+  grep -E '^(rss|max RSS|waitfor)' | sed '1d' |
+  sed '1s/^rss:/RSS after the scan:/; 2s/^waitfor .Modified.:/r to the new tree:/; 3s/^rss:/RSS after r:/; s/^max RSS:/max RSS over both:/'
 FRAME=target/release/examples/frame
 if [ -x "$FRAME" ]; then
   echo

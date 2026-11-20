@@ -2,6 +2,144 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
+## [0.4.0] - Unreleased
+
+### Added
+- Ticks: Space ticks or unticks the selected row and goes on to the next; a drag with the left
+  button over the rows ticks them (dragging back takes the ticks off again; past the top or
+  bottom the list scrolls). The shown folder's own row takes no tick. Every other row has a
+  tick box in its icon's place, files and folders alike (`☐` and `☑`; `[ ]` and `[x]` in
+  ASCII; the file icon `▪` gives way to it): a click on it ticks or unticks the row and puts
+  the cursor there (two quick clicks are two ticks, never a double click), the pointer on it
+  underlines it, and a drag from it gives the rows it goes over the state it took. A ticked
+  folder ticks everything in it (each row shows `☑`); taking the tick off one item in it takes
+  off only that item: the folder's tick goes, and each other item on the way down is ticked on
+  its own (a drag that takes ticks off does the same; one that puts them on changes nothing
+  in a ticked folder). A folder that is not ticked but holds a ticked item shows `◩` (`[-]`
+  in ASCII), even when all in it is ticked, since the folder itself would not go; a click
+  there ticks the folder, and the ticks in it become part of it. A ticked row has a tint
+  too, and the status bar says how many are ticked on their own (as the dialog lists them;
+  a ticked folder is one) and how big.
+  Ticks stay when another folder is shown or the order changes, and after a scan again (by
+  path). Esc clears them.
+- Del with ticks moves the ticked items, not the selected row; what shows ticked is what may
+  go. Each is checked first, and a ticked folder that passes goes whole. One that cannot go
+  is listed in the dialog with why and stays; if what is in it may still go (the folder
+  protects only itself, as `~/.cache` and Downloads, or the refusal is about something in it,
+  such as a locked item), each item in it is checked on its own, and so on down. A folder
+  that cannot go with all in it (`~/.config`, `~/.local`, not yours, a mount point) and a home
+  are not opened up. Those that cannot go stay ticked, a folder opened up this way too, once
+  what was in it has gone; if none can go, the status bar says why and no dialog opens.
+  The dialog for several items shows how many and how big, and every path, whole, in a list
+  that scrolls (↑ ↓ PgUp PgDn Home End, the wheel; PgDn never splits a path between two
+  pages); Move to Trash works only once every path to move has been shown whole (what End
+  jumps over does not count), with the same waits as for one item. Each item then goes
+  through every check again, one at a time; the status bar says how many went and how big,
+  and what did not. One ticked item has the dialog for one, titled "Move the ticked item to
+  the trash?". A key while the mouse button is held, or new rows, end a drag.
+- Emptying the trash, for good: Del on the start screen's Trash scans the trash, then a dialog
+  says how many items and how much disk will be deleted permanently and that this cannot be
+  undone, with the trash dialog's focus and waits (Empty Trash in place of Move to Trash);
+  Del on the trash folder's own row while browsing it does the same. Each item in `files`
+  goes, then its `.trashinfo`, then `directorysizes`; the trash folders stay. It runs on a
+  thread of its own under a card (Esc stops it: the item it is at stays in the trash, partly
+  deleted; keys and clicks wait),
+  then the status bar says how many items went, how much was freed, and what could not go and
+  why, and the trash is scanned again. Only through folders held open, never through a
+  symbolic link (one in the trash is removed itself) or into a mount point or another
+  filesystem, only what is yours, only a trash in your home whose folders are real folders of
+  yours (`files` and `info` no mount point); it changes no permissions, so what a
+  read-only folder in the trash holds stays and is reported. An empty trash: a message, no
+  dialog. Not with `--read-only`.
+- Library: `Colors` has two more fields, `tick_bg` and `tick_fg` (the tint of a ticked row,
+  and its ticked box): a host that builds `Colors` field by field must add them. A host gives
+  the view the left button's drags and releases as well as its clicks. In the icon sets the
+  tick boxes (`boxes`: not ticked, ticked, holding a ticked item) replaced the tick mark and
+  the file icon.
+
+### Changed
+- The title bar ends with termdisk's version ("termdisk v0.4.0") on every screen. Where the
+  title has no room, the path is cut in its middle first, then the size goes; the version
+  stays. On another filesystem than the trash, the "look only" note gives way before the
+  size.
+- The tree's names get the room the columns do not use: Size and Items are as wide as their
+  values on screen, and Usage's bar gives up to 5 of its 8 cells while names are cut. Which
+  columns show is decided as before (Items goes first in a narrow pane; the sorted column
+  stays), so it does not change as the rows scroll.
+- The map's tiles show their text in bold, on every tile.
+- The lock shows only on what cannot be trashed itself: a protected path or what lies inside a
+  wholly protected one, what is not yours, a mount point, a folder that could not be read. A
+  folder that only holds such an item has no lock (it still cannot be trashed); Del on it says
+  how many locked items it holds and the first one the check met. With the pointer on a lock,
+  in the tree or on a tile, a box says why ("protected: ~/.config, with everything in it",
+  "not yours: another user owns it", "a mount point: …", "could not be read"), from what the
+  scan saw: drawing it never waits on the disk.
+- After a move to the trash the folder is scanned again at once, and `r` does the same. The
+  last tree is let go as the scan starts, so two trees never share the memory: the scan's card
+  shows meanwhile, under the folder's path, with the message of what the trash did (keys
+  wait; Esc stops it and goes back to the places, as for a first scan). Then the new tree
+  shows as the last one was: the same folder, folders open, ticks, item selected on
+  the same line (or the nearest folder above it still there), all kept by path. Where the
+  trash lies inside the scanned folder (a home), the item now shows there, in
+  `.local/share/Trash`, instead of leaving the total. A folder that cannot be scanned again
+  keeps its tree, and the message says why.
+- The map is laid out in strips: rows of tiles as wide as the map, from top to bottom, each
+  filled left to right largest first (an ordered strip treemap, Bederson, Shneiderman and
+  Wattenberg), so the tiles read like text, the tiles of a row share their top and bottom,
+  and items of one size and name length get tiles of one width. Every tile shows its size and
+  its share of the folder ("7.3 MB  4%", as the Usage column), so areas follow the sizes
+  compressed (`size ^ 0.6`): a folder whose largest item is a million times its smallest still
+  shows many of them, the larger ones larger. Nothing on a tile is cut: an item has a tile of
+  its own only where its class letter, whole name, size and share fit inside the frame (and 4
+  rows); the others, also an item whose name is wider than the map or that no strip has room
+  for beside the others (the items after it keep their tiles, for up to 8 such items), share
+  the last tile, "+N items", which lists them inside its frame, largest first, a name, its
+  size and share a line,
+  each line whole or told in "+N more"; too narrow for its label it shows "+N". The strips
+  break where that gives the most items a tile of their own, then the squarest tiles nearest
+  their areas; each strip is its height in whole rows, rounded down or up so that every strip,
+  the last too, is within a row of its exact height. In a strip each tile gets its text's
+  columns and the room left goes by area; the texts of small items may squeeze a larger one,
+  never under half its area, so a small item with a long name can be drawn larger than a
+  larger neighbour (the size and share on each tile are right). The gap under a row of tiles
+  is half a row in the Nerd and Unicode sets (`▀` in the tile's colour), as wide to the eye as
+  the column between tiles; ASCII keeps a whole row. The rest's tile has a frame from 2 rows
+  up. On a 300x80 screen the layout takes 0.6 ms for 400 files of one size and
+  1.4 ms for a folder of 166 000 files, both with the narrowest texts a tile can have
+  (names make them fewer a row); the whole view with that folder shown, 1.3 to 1.4 ms.
+- A scan again through a symlink put where the folder was keeps no ticks: a path below the
+  folder may now be something else, and ticks pick what Del moves.
+- Memory: the tree takes 58 bytes per entry (was 73): a node is 40 bytes (was 56). On a home
+  of 1.24 million entries, `--summary` peaks at 87 MB (was 106) and a scan again at 88 MB
+  (was 211 to 222: the last tree was kept until the new one was shown). The program fixes glibc's
+  limit for mapping large blocks at 128 KiB (glibc raised it as trees were freed, and a scan
+  again then grew the next tree inside the heap: 40 MB more), and after each scan hands the
+  memory freed back to the system (`malloc_trim`; a host with glibc's defaults gains that
+  part).
+- The scan uses up to 12 threads (was 8): 1.24 million entries warm in 0.26 s (was 0.30, the
+  time `--summary` prints).
+- Library: `tree::NOT_OWNED`, `UNREADABLE`, `MOUNT` and `PROTECTED` now mark the item itself
+  only; the new `tree::HOLDS` marks the folders above one, and `tree::LOCKED` is the four.
+- Library: `Node` is 40 bytes. `Node::items` is gone: `Tree::items(id)` counts what lies under
+  a folder (0 for a file). `Node::mtime` is a `u32` of seconds since the epoch (was `i64`): 0
+  before 1970, `u32::MAX` after 2106. `treemap::layout` takes a third argument, `cols(item)`:
+  the columns the tile of `item` needs for its whole text, frame and gutter; its tiles are
+  strips, every `Item::One` tile at least that wide and 4 rows high, and a single item without
+  a tile is `Item::Rest(1)` (it was `Item::One` of its own).
+
+### Fixed
+- The trash dialog: Tab, Shift+Tab and the arrows move the focus at once (they did nothing for
+  the first half second, so a quick Del, Tab, Enter pressed Cancel). Nothing can move any
+  sooner: Enter on Move to Trash does nothing, and the dialog stays, until the half second is
+  over and the focus has been there a moment; meanwhile the focused button is drawn in the
+  focus's colours, crossed out.
+- A home without `~/.local/share` could not trash anything ("the trash cannot be used: No such
+  file or directory"). The missing folders are made now, mode 0700, as the first item goes
+  (not when the dialog opens: `check` makes nothing), only inside your home and in a folder of
+  yours, none through a symbolic link; the start screen and the title no longer call such a
+  home "look only". Folders above the trash that are symbolic links (`/home` on some systems,
+  your own `~/.local`) work as before.
+
 ## [0.3.0] - 2026-11-19
 
 ### Added

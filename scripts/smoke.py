@@ -21,6 +21,7 @@
 #   count:TEXT    print how often TEXT is in all its output
 #   palette       print how many true colours it used and which indexed ones (0-15: the 16)
 #   threads       print its thread count
+#   rss           print its resident memory now (VmRSS; max RSS is printed at the end)
 #   ctx:S         print its voluntary context switches (wake-ups) over S seconds
 #   winsize:C;R   resize the terminal to C columns, R rows
 #   signal:NAME   send it a signal (TERM, INT, HUP)
@@ -125,6 +126,9 @@ for st in steps:
         print(f'palette: {len(re.findall(rb"[34]8;2;", out))} true colours, indexed {sorted(idx)}')
     elif k == 'threads':
         print(f'threads: {len(os.listdir(f"/proc/{p.pid}/task"))}')
+    elif k == 'rss':
+        kb = next(int(l.split()[1]) for l in open(f'/proc/{p.pid}/status') if l.startswith('VmRSS'))
+        print(f'rss: {kb // 1024} MB')
     elif k == 'ctx':
         a = ctx()
         time.sleep(float(v))

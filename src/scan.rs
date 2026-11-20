@@ -28,7 +28,9 @@ use crate::tree::{NodeId, Tree, DIR, HARDLINK_DUP, KIND, LINKED, MOUNT, NOT_OWNE
 type Job = (u32, PathBuf, u64);
 
 // ponytail: a fixed cap on walker threads; retune it with scripts/bench.sh rather than add a flag.
-const MAX_THREADS: usize = 8;
+// 12 (all of this 12-thread machine) scanned 1.24 million entries warm in 0.26 s, 8 in 0.30 s,
+// for 4 to 7 MB more at the peak (a smaller channel did not take that back, and was slower).
+const MAX_THREADS: usize = 12;
 /// `Entry::dir_id` of an entry that will not be walked.
 const NO_DIR: u32 = u32::MAX;
 
@@ -353,16 +355,22 @@ fn build(sh: &Shared, rx: Receiver<Batch>, mut tree: Tree) -> Option<Tree> {
         p.bytes.fetch_add(bytes, Relaxed);
     }
     if p.cancel.load(Relaxed) {
+        // A stopped scan's tree is dropped here: give it back too.
+        drop(tree);
+        sys::give_back_free_memory();
         return None;
     }
     tree.finish();
+    // The batches and the tree's spare capacity are freed by now; the walkers' arenas would
+    // keep them.
+    sys::give_back_free_memory();
     Some(tree)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::SYMLINK;
+    use crate::tree::{HOLDS, SYMLINK};
     use crate::TempDir;
     use std::fs::Permissions;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -442,7 +450,7 @@ mod tests {
         let (tree, errors) = run(&t.0, me());
         let root = tree.node(tree.root());
         assert_eq!(
-            (root.alloc, root.apparent, root.items),
+            (root.alloc, root.apparent, tree.items(tree.root())),
             expected(&t.0, &mut HashSet::new())
         );
         assert_eq!((errors, tree.len()), (0, 12));
@@ -488,7 +496,7 @@ mod tests {
             assert!(tree.children(id).is_empty());
         }
         let r = tree.node(tree.root());
-        assert_eq!(r.items, 2);
+        assert_eq!(tree.items(0), 2);
         assert!(
             r.apparent < 1 << 20 && r.alloc < 1 << 20,
             "the 1 MiB file behind a link is not counted"
@@ -496,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_folder_is_flagged_up_to_the_root() {
+    fn an_unreadable_folder_is_flagged_and_the_folders_above_hold_it() {
         if me() == 0 {
             return; // root reads anything
         }
@@ -508,9 +516,12 @@ mod tests {
         fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap(); // test-only
         let (tree, errors) = run(&t.0, me());
         fs::set_permissions(&locked, Permissions::from_mode(0o755)).unwrap(); // test-only
-        let flagged = |p: &str| tree.node(tree.find(Path::new(p)).unwrap()).flags & UNREADABLE != 0;
-        assert!(flagged("open/locked") && flagged("open") && flagged(""));
-        assert!(!flagged("fine"));
+        let flags = |p: &str| tree.node(tree.find(Path::new(p)).unwrap()).flags;
+        assert!(flags("open/locked") & UNREADABLE != 0);
+        for p in ["open", ""] {
+            assert_eq!(flags(p) & (UNREADABLE | HOLDS), HOLDS, "{p:?}");
+        }
+        assert_eq!(flags("fine") & (UNREADABLE | HOLDS), 0);
         assert_eq!((errors, tree.errors), (1, 1));
     }
 
@@ -585,7 +596,7 @@ mod tests {
         check_links_paths_and_inodes(&tree);
         let root = tree.node(0);
         assert_eq!(
-            (root.alloc, root.apparent, root.items),
+            (root.alloc, root.apparent, tree.items(0)),
             expected(&t.0, &mut HashSet::new())
         );
     }

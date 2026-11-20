@@ -3,7 +3,8 @@
 //! The one way termdisk removes anything: `trash`, which moves one item to the home trash.
 //! Before it does, it checks on the disk itself, at that moment, never trusting the scan:
 //!
-//! 1. nothing is ever deleted: the item is renamed into the trash, or left where it is;
+//! 1. nothing is deleted: the item is renamed into the trash, or left where it is (emptying
+//!    the trash, rule 13, is the only deleting, and only of what is in it);
 //! 2. no extra powers: a process that is root, runs setuid, or may change others' files
 //!    cannot trash;
 //! 3. the item and everything under it belong to the user;
@@ -14,11 +15,22 @@
 //!    search permission is enough), the item must still be the inode the scan saw, and the
 //!    check and the rename use that same parent;
 //! 9. not the scan root, not trashed already (and a tree only exists once its scan is done);
-//! 10. the trash folders are real folders of the user's, on the item's filesystem;
+//! 10. the trash folders are real folders of the user's (`files` and `info` no mount point),
+//!     on the item's filesystem; those missing are made (mode 0700) only as an item is moved,
+//!     not by `check`: the folders of the data home only inside the user's home (a path with
+//!     `..` is not), in a folder of the user's, none through a symlink;
 //! 11. when unsure (no HOME, unreadable capabilities, an old kernel), nothing can be trashed;
 //! 12. `trash` is the only caller of `trash::put`, which needs a `Checked` made only here; and
 //!     `Policy::detect` is the only place that reads HOME, XDG_* and the passwd entry, so a
-//!     program embedding termdisk cannot hand it a home of its own.
+//!     program embedding termdisk cannot hand it a home of its own;
+//! 13. emptying the trash (`empty_trash`, then `ToEmpty::run`, the only caller of
+//!     `trash::empty`) deletes for good what is in the home trash's `files`, with the matching
+//!     `.trashinfo`, and nothing else: not as root or with extra powers (rule 2), only a trash
+//!     in the user's home (the data home as set, before symlinks are resolved, with no `..`)
+//!     whose folders are real folders of the user's (rule 10), through folders held open,
+//!     never through a symlink, never across a mount point or into another filesystem, only
+//!     what is the user's. It changes no permissions: what a read-only folder holds stays, and
+//!     is reported.
 
 use std::collections::HashSet;
 use std::env;
@@ -30,7 +42,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::sys::{self, Dir, Stat};
-use crate::trash::{put, Trash};
+use crate::trash::{self, put, Emptied, Found, Tally, Trash};
 use crate::tree::{NodeId, Tree, DIR, TRASHED};
 
 /// Home paths protected with everything under them: settings and app data (browsers, mail,
@@ -103,8 +115,13 @@ pub struct Policy {
     pub(crate) euid: u32,
     /// The home the start screen offers (the first of the homes protected).
     home: PathBuf,
+    /// Every home: HOME as set and as resolved, the passwd one.
+    homes: Vec<PathBuf>,
     cache_home: PathBuf,
     data_home: PathBuf,
+    /// The data home lies in the user's home, as set (before symlinks in it are resolved; a
+    /// `..` in it counts as outside).
+    trash_in_home: bool,
     /// Protected paths; `true` protects everything under the path too.
     protected: Vec<(PathBuf, bool)>,
     /// Why nothing may be trashed at all, if so.
@@ -157,7 +174,9 @@ impl Policy {
             homes.push(p);
         }
         let first = homes.first().cloned().unwrap_or_else(|| PathBuf::from("/"));
-        let data = canon(var("XDG_DATA_HOME").unwrap_or_else(|| first.join(".local/share")));
+        let raw_data = var("XDG_DATA_HOME").unwrap_or_else(|| first.join(".local/share"));
+        let trash_in_home = !homes.is_empty() && trash::inside(&raw_data, &first);
+        let data = canon(raw_data);
         let config = canon(var("XDG_CONFIG_HOME").unwrap_or_else(|| first.join(".config")));
         let runtime = var("XDG_RUNTIME_DIR").map(canon);
         let raw = raw_home.as_deref();
@@ -165,6 +184,8 @@ impl Policy {
         if let Some(cache) = var("XDG_CACHE_HOME").map(canon) {
             policy.cache_home = cache;
         }
+        // A ~/.local of the user's that is a symlink elsewhere still counts as in the home.
+        policy.trash_in_home |= trash_in_home;
         policy
     }
 
@@ -222,9 +243,12 @@ impl Policy {
             }
         }
         let home = homes.first().cloned().unwrap_or_else(|| PathBuf::from("/"));
+        let raw = raw_home.map(Path::to_path_buf);
         Policy {
             euid,
+            homes: raw.into_iter().chain(homes.iter().cloned()).collect(),
             cache_home: home.join(".cache"),
+            trash_in_home: trash::inside(data_home, &home),
             home,
             data_home: data_home.to_path_buf(),
             protected,
@@ -241,6 +265,11 @@ impl Policy {
         &self.home
     }
 
+    /// Whether `path` is one of the user's homes.
+    pub(crate) fn is_home(&self, path: &Path) -> bool {
+        self.homes.iter().any(|h| h == path)
+    }
+
     pub fn cache_home(&self) -> &Path {
         &self.cache_home
     }
@@ -250,9 +279,14 @@ impl Policy {
         self.data_home.join("Trash")
     }
 
-    /// Whether items on `dev` could be renamed into the home trash at all.
+    /// Whether items on `dev` could be renamed into the home trash at all (one not made yet:
+    /// the folder it would be made in).
     pub fn trash_reaches(&self, dev: u64) -> bool {
-        sys::stat_path(&self.data_home).is_ok_and(|s| s.dev == dev)
+        match trash::find(&self.data_home, &self.home, self.euid, false) {
+            Ok(Found::Trash(t)) => t.dev == dev,
+            Ok(Found::Missing(d)) => d == dev,
+            Err(_) => false,
+        }
     }
 
     /// Marks the protected paths in a scanned tree for the view. Only a hint: `trash` checks
@@ -263,6 +297,25 @@ impl Policy {
             if let Some(id) = p.strip_prefix(&root).ok().and_then(|rel| tree.find(rel)) {
                 tree.mark_protected(id, *subtree);
             }
+        }
+    }
+
+    /// For the view to say why an item is locked: the protected path that `path` is (a whole
+    /// tree preferred), else the nearest one whose whole tree it lies inside; with whether that
+    /// path's whole tree is protected and whether `path` is that path itself. Only a hint, as
+    /// `mark` is: `trash` does not use it.
+    pub(crate) fn protection(&self, path: &Path) -> Option<(&Path, bool, bool)> {
+        let exact = (self.protected.iter())
+            .filter(|(p, _)| p == path)
+            .max_by_key(|(_, tree)| *tree);
+        let inside = || {
+            (self.protected.iter())
+                .filter(|(p, tree)| *tree && path.starts_with(p))
+                .max_by_key(|(p, _)| p.as_os_str().len())
+        };
+        match exact {
+            Some((p, tree)) => Some((p, *tree, true)),
+            None => inside().map(|(p, tree)| (p.as_path(), *tree, false)),
         }
     }
 
@@ -435,19 +488,29 @@ pub(crate) struct Checked {
 /// view's. A program that calls this directly instead of going through `View` must ask the
 /// user itself.
 pub fn trash(tree: &Tree, id: NodeId, policy: &Policy) -> Result<Trashed, Refusal> {
-    let (item, trash) = checked(tree, id, policy)?;
+    let item = checked(tree, id, policy)?;
+    // Only now is what is missing of the trash made; then it is checked again as it is.
+    let trash = Trash::open(&policy.data_home, &policy.home, policy.euid).map_err(no_trash)?;
+    if item.stat.dev != trash.dev {
+        return Err(Refusal::OtherFilesystem(item.path));
+    }
     let from = item.path.clone();
     let to = put(&trash, item).map_err(Refusal::Failed)?;
     Ok(Trashed { from, to })
 }
 
-/// Every check `trash` makes, moving nothing: whether `trash` would go ahead right now (it
-/// checks again when asked). It makes the trash folders if they are missing.
+/// Every check `trash` makes, moving nothing and making nothing: whether `trash` would go
+/// ahead right now (it checks again when asked). A trash not made yet passes if `trash` could
+/// make it.
 pub fn check(tree: &Tree, id: NodeId, policy: &Policy) -> Result<(), Refusal> {
     checked(tree, id, policy).map(|_| ())
 }
 
-fn checked(tree: &Tree, id: NodeId, policy: &Policy) -> Result<(Checked, Trash), Refusal> {
+fn no_trash(e: io::Error) -> Refusal {
+    Refusal::NoTrash(e.to_string())
+}
+
+fn checked(tree: &Tree, id: NodeId, policy: &Policy) -> Result<Checked, Refusal> {
     if let Some(why) = &policy.read_only {
         return Err(Refusal::ReadOnly(why.clone()));
     }
@@ -481,9 +544,12 @@ fn checked(tree: &Tree, id: NodeId, policy: &Policy) -> Result<(Checked, Trash),
     if protected.contains(&(st.dev, st.ino)) {
         return Err(Refusal::Protected(path));
     }
-    let trash =
-        Trash::open(&policy.data_home, policy.euid).map_err(|e| Refusal::NoTrash(e.to_string()))?;
-    if st.dev != trash.dev {
+    let trash_dev = match trash::find(&policy.data_home, &policy.home, policy.euid, false) {
+        Ok(Found::Trash(t)) => t.dev,
+        Ok(Found::Missing(dev)) => dev,
+        Err(e) => return Err(no_trash(e)),
+    };
+    if st.dev != trash_dev {
         return Err(Refusal::OtherFilesystem(path));
     }
     if st.kind == DIR {
@@ -499,14 +565,50 @@ fn checked(tree: &Tree, id: NodeId, policy: &Policy) -> Result<(Checked, Trash),
         };
         check_tree(&dir, &path, &rules, &mut Vec::new())?;
     }
-    let item = Checked {
+    Ok(Checked {
         parent,
         name,
         stat: st,
         path,
         _only_the_guard: (),
-    };
-    Ok((item, trash))
+    })
+}
+
+/// The home trash, checked moments ago and held open, to be emptied: only `empty_trash` makes
+/// one (the private field).
+pub(crate) struct ToEmpty {
+    trash: Trash,
+    euid: u32,
+    _only_the_guard: (),
+}
+
+impl ToEmpty {
+    /// Deletes what is in the trash for good (rule 13). It can take long: run it away from the
+    /// thread that draws, which reads `tally` and may set its stop.
+    pub fn run(self, tally: &Tally) -> Emptied {
+        trash::empty(&self.trash, self.euid, tally)
+    }
+}
+
+/// Checks that the home trash may be emptied now (rule 13) and holds it open for `run`. It
+/// makes nothing: a trash not made yet is refused. It asks nothing: the confirmation is the
+/// view's.
+pub(crate) fn empty_trash(policy: &Policy) -> Result<ToEmpty, Refusal> {
+    if let Some(why) = &policy.read_only {
+        return Err(Refusal::ReadOnly(why.clone()));
+    }
+    if !policy.trash_in_home {
+        return Err(Refusal::NoTrash("it is not in your home".into()));
+    }
+    match trash::find(&policy.data_home, &policy.home, policy.euid, false) {
+        Ok(Found::Trash(trash)) => Ok(ToEmpty {
+            trash,
+            euid: policy.euid,
+            _only_the_guard: (),
+        }),
+        Ok(Found::Missing(_)) => Err(Refusal::NoTrash("there is none yet".into())),
+        Err(e) => Err(no_trash(e)),
+    }
 }
 
 /// What every entry under a folder being trashed must meet.
@@ -714,7 +816,7 @@ mod tests {
     #[test]
     fn rule1_an_orphan_in_the_trash_is_never_replaced() {
         let f = fix("r1-orphan");
-        Trash::open(&f.home.join(".local/share"), me())
+        Trash::open(&f.home.join(".local/share"), &f.home, me())
             .ok()
             .unwrap();
         let trash = f.home.join(".local/share/Trash");
@@ -734,7 +836,7 @@ mod tests {
         }
         let f = fix("r1-fail");
         let mut tree = scan(&f.t.0);
-        Trash::open(&f.home.join(".local/share"), me())
+        Trash::open(&f.home.join(".local/share"), &f.home, me())
             .ok()
             .unwrap();
         let files = f.home.join(".local/share/Trash/files");
@@ -823,7 +925,7 @@ mod tests {
     #[test]
     fn rule4_protected_paths_are_refused_and_what_is_in_cache_is_not() {
         let f = fix("r4-protected");
-        Trash::open(&f.home.join(".local/share"), me())
+        Trash::open(&f.home.join(".local/share"), &f.home, me())
             .ok()
             .unwrap();
         fs::write(f.home.join(".local/share/Trash/files/old"), b"old").unwrap();
@@ -1059,6 +1161,26 @@ mod tests {
     }
 
     #[test]
+    fn rule4_says_which_protected_path_an_item_is_or_lies_in() {
+        let f = fix("r4-why");
+        let h = &f.home;
+        let why = |rel: &str| {
+            let p = f.policy.protection(&h.join(rel));
+            p.map(|(p, tree, itself)| (p.to_path_buf(), tree, itself))
+        };
+        assert_eq!(why(".ssh"), Some((h.join(".ssh"), true, true)));
+        assert_eq!(why(".ssh/id"), Some((h.join(".ssh"), true, false)));
+        assert_eq!(why("Downloads"), Some((h.join("Downloads"), false, true)));
+        assert_eq!(why(".cache"), Some((h.join(".cache"), false, true)));
+        assert_eq!(why(".cache/app"), None, "what is in .cache may go");
+        assert_eq!(why("work"), None);
+        // Inside two protected trees: the nearest one.
+        let data = h.join(".local/share");
+        assert_eq!(why(".local/share/x"), Some((data.clone(), true, false)));
+        assert_eq!(why(".local/share"), Some((data, true, true)));
+    }
+
+    #[test]
     fn rule5_a_folder_with_an_unreadable_folder_in_it_is_refused() {
         if me() == 0 {
             return;
@@ -1179,6 +1301,254 @@ mod tests {
         assert!(!tmp.join("mine").exists());
     }
 
+    /// A home with no `.local` at all, a file to trash in it, and the policy for it.
+    fn bare(tag: &str) -> Fix {
+        let t = TempDir::new(tag);
+        let home = fs::canonicalize(&t.0).unwrap().join("home");
+        fs::create_dir_all(home.join("work")).unwrap();
+        fs::create_dir_all(t.0.join("run")).unwrap();
+        fs::write(home.join("work/f"), b"f").unwrap();
+        let policy = policy_for(&home, &t.0, None);
+        Fix { t, home, policy }
+    }
+
+    #[test]
+    fn rule10_a_missing_trash_is_made_private_and_only_as_an_item_moves() {
+        let f = bare("r10-make");
+        let mut tree = scan(&f.home);
+        let item = f.home.join("work/f");
+        check(&tree, tree.find(&item).unwrap(), &f.policy).unwrap();
+        assert!(
+            f.policy.trash_reaches(tree.dev),
+            "it would be made on this filesystem"
+        );
+        assert!(!f.home.join(".local").exists(), "checking makes nothing");
+        try_trash(&mut tree, &item, &f.policy).unwrap();
+        assert!(!item.exists() && f.home.join(".local/share/Trash/files/f").exists());
+        for d in [
+            "",
+            "/share",
+            "/share/Trash",
+            "/share/Trash/files",
+            "/share/Trash/info",
+        ] {
+            let mode = fs::metadata(f.home.join(format!(".local{d}")))
+                .unwrap()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "made private: .local{d}");
+        }
+    }
+
+    #[test]
+    fn rule10_a_missing_data_home_outside_the_home_is_not_made() {
+        let f = bare("r10-outside");
+        let elsewhere = f.t.0.join("elsewhere/share");
+        let config = f.home.join(".config");
+        let p = Policy::new(
+            me(),
+            None,
+            std::slice::from_ref(&f.home),
+            &elsewhere,
+            &config,
+            None,
+            None,
+        );
+        let mut tree = scan(&f.home);
+        assert!(!p.trash_reaches(tree.dev));
+        let r = try_trash(&mut tree, &f.home.join("work/f"), &p);
+        let outside = |e: &str| e.contains("only inside your home");
+        assert!(
+            matches!(&r, Err(Refusal::NoTrash(e)) if outside(e)),
+            "{r:?}"
+        );
+        assert!(!f.t.0.join("elsewhere").exists() && f.home.join("work/f").exists());
+    }
+
+    #[test]
+    fn rule10_a_symlink_of_the_users_above_the_trash_still_trashes() {
+        // ~/.local a symlink to a folder of the user's, on the same filesystem: opened as given.
+        let f = bare("r10-linked");
+        let real = f.home.join("dotlocal");
+        fs::create_dir_all(real.join("share")).unwrap();
+        symlink(&real, f.home.join(".local")).unwrap();
+        let mut tree = scan(&f.home);
+        try_trash(&mut tree, &f.home.join("work/f"), &f.policy).unwrap();
+        assert!(real.join("share/Trash/files/f").exists());
+        // ~/.local/share a symlink out of the home: `detect` resolves it; it still counts as in
+        // the home (as set), so its trash may be emptied too.
+        let g = bare("r10-linked-share");
+        let real = g.t.0.join("data");
+        fs::create_dir_all(g.home.join(".local")).unwrap();
+        fs::create_dir(&real).unwrap();
+        symlink(&real, g.home.join(".local/share")).unwrap();
+        let raw = g.home.clone().into_os_string();
+        let env = |k: &str| (k == "HOME").then(|| raw.clone());
+        let p = Policy::from_env(false, me(), me(), env, None, Some(NO_CAPS));
+        let mut tree = scan(&g.home);
+        try_trash(&mut tree, &g.home.join("work/f"), &p).unwrap();
+        assert!(real.join("Trash/files/f").exists());
+        let out = empty_trash(&p).unwrap().run(&Tally::default());
+        assert_eq!((out.items, out.failed.len()), (1, 0), "{out:?}");
+        assert!(!real.join("Trash/files/f").exists());
+    }
+
+    /// The policy `detect` makes for `home` with XDG_DATA_HOME set to `data`.
+    fn with_data_home(home: &Path, data: PathBuf) -> Policy {
+        let (home, data) = (home.as_os_str().to_owned(), data.into_os_string());
+        let env = move |k: &str| match k {
+            "HOME" => Some(home.clone()),
+            "XDG_DATA_HOME" => Some(data.clone()),
+            _ => None,
+        };
+        Policy::from_env(false, me(), me(), env, None, Some(NO_CAPS))
+    }
+
+    #[test]
+    fn rule10_and_13_a_data_home_through_dotdot_is_not_in_the_home() {
+        // There: items still go to its trash, as before, but it is not emptied.
+        let f = bare("dotdot");
+        let data = f.t.0.join("elsewhere/data");
+        for d in ["Trash/files", "Trash/info"] {
+            fs::create_dir_all(data.join(d)).unwrap();
+        }
+        fs::write(data.join("Trash/files/x"), b"x").unwrap();
+        let p = with_data_home(&f.home, f.home.join("../elsewhere/data"));
+        let mut tree = scan(&f.home);
+        try_trash(&mut tree, &f.home.join("work/f"), &p).unwrap();
+        let r = empty_trash(&p).err();
+        let away = |e: &str| e.contains("not in your home");
+        assert!(matches!(&r, Some(Refusal::NoTrash(e)) if away(e)), "{r:?}");
+        assert!(data.join("Trash/files/x").exists() && data.join("Trash/files/f").exists());
+        // Not there: nothing is made out of the home.
+        let g = bare("dotdot-make");
+        let p = with_data_home(&g.home, g.home.join("../mine/share"));
+        let mut tree = scan(&g.home);
+        assert!(!p.trash_reaches(tree.dev));
+        let r = try_trash(&mut tree, &g.home.join("work/f"), &p);
+        assert!(matches!(&r, Err(Refusal::NoTrash(_))), "{r:?}");
+        assert!(!g.t.0.join("mine").exists() && g.home.join("work/f").exists());
+    }
+
+    #[test]
+    fn rule13_emptying_deletes_what_is_in_the_trash_and_keeps_its_folders() {
+        let f = fix("r13-empty");
+        let mut tree = scan(&f.t.0);
+        for p in [".cache/app/blob", ".cache/app/deep", "work/sub"] {
+            try_trash(&mut tree, &f.home.join(p), &f.policy).unwrap();
+        }
+        let trash = f.home.join(".local/share/Trash");
+        // A symlink in it, as another program may leave one: it goes, what it points to stays.
+        let target = f.t.0.join("outside/inner/f");
+        symlink(&target, trash.join("files/link")).unwrap();
+        fs::write(trash.join("info/link.trashinfo"), b"[Trash Info]\n").unwrap();
+        // Links to a folder, at the top and inside an item: each goes, never what is in it.
+        let outside = f.t.0.join("outside");
+        symlink(&outside, trash.join("files/dirlink")).unwrap();
+        symlink(&outside, trash.join("files/sub/dirlink")).unwrap();
+        fs::write(trash.join("directorysizes"), b"").unwrap();
+        // Stopped before the first item: nothing goes.
+        let stopped = Tally::default();
+        stopped
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let out = empty_trash(&f.policy).unwrap().run(&stopped);
+        assert!(
+            out.stopped && out.items == 0 && out.failed.is_empty(),
+            "{out:?}"
+        );
+        assert_eq!(fs::read_dir(trash.join("files")).unwrap().count(), 5);
+        let tally = Tally::default();
+        let out = empty_trash(&f.policy).unwrap().run(&tally);
+        assert_eq!(
+            (out.items, out.failed.len(), out.stopped),
+            (5, 0, false),
+            "{out:?}"
+        );
+        assert!(out.bytes >= 40_000, "{out:?}");
+        assert_eq!(tally.items.load(std::sync::atomic::Ordering::Relaxed), 5);
+        assert!(fs::symlink_metadata(trash.join("files/dirlink")).is_err());
+        assert!(
+            fs::symlink_metadata(trash.join("files/sub")).is_err(),
+            "and the inner one"
+        );
+        assert_eq!(fs::read(outside.join("inner/f")).unwrap(), b"outside");
+        for d in ["files", "info"] {
+            assert_eq!(fs::read_dir(trash.join(d)).unwrap().count(), 0, "{d}");
+            let mode = fs::metadata(trash.join(d)).unwrap().mode();
+            assert_eq!(mode & 0o777, 0o700, "{d} kept as it was");
+        }
+        assert!(!trash.join("directorysizes").exists());
+        assert_eq!(fs::read(&target).unwrap(), b"outside");
+        assert!(f.home.join(".cache/app").exists() && f.home.join("keep/f").exists());
+    }
+
+    #[test]
+    fn rule13_what_a_read_only_folder_holds_stays_and_is_reported() {
+        let f = fix("r13-ro");
+        let mut tree = scan(&f.t.0);
+        for p in [".cache/app/blob", "work/sub"] {
+            try_trash(&mut tree, &f.home.join(p), &f.policy).unwrap();
+        }
+        let trash = f.home.join(".local/share/Trash");
+        let sub = trash.join("files/sub");
+        fs::set_permissions(&sub, Permissions::from_mode(0o555)).unwrap(); // test-only
+        let out = empty_trash(&f.policy).unwrap().run(&Tally::default());
+        fs::set_permissions(&sub, Permissions::from_mode(0o755)).unwrap(); // test-only
+        assert_eq!(out.items, 1, "{out:?}");
+        let [(path, why)] = &out.failed[..] else {
+            panic!("{out:?}")
+        };
+        assert_eq!(path, &sub.join("x"));
+        assert!(why.contains("Permission denied"), "{why}");
+        assert!(sub.join("x").exists() && trash.join("info/sub.trashinfo").exists());
+        assert!(!trash.join("files/blob").exists());
+        assert!(!trash.join("info/blob.trashinfo").exists());
+    }
+
+    #[test]
+    fn rule13_emptying_is_refused_read_only_through_a_symlink_or_out_of_the_home() {
+        let f = fix("r13-refuse");
+        let ro = policy_for(&f.home, &f.t.0, Some("read-only: test".into()));
+        assert!(matches!(empty_trash(&ro).err(), Some(Refusal::ReadOnly(_))));
+        // No trash yet: nothing to empty, and nothing made.
+        let r = empty_trash(&f.policy).err();
+        assert!(
+            matches!(&r, Some(Refusal::NoTrash(e)) if e.contains("none yet")),
+            "{r:?}"
+        );
+        assert!(!f.home.join(".local/share/Trash").exists());
+        // A Trash that is a symlink: refused, what it points to untouched.
+        let outside = f.t.0.join("outside");
+        for d in ["files", "info"] {
+            fs::create_dir(outside.join(d)).unwrap();
+        }
+        fs::write(outside.join("files/precious"), b"p").unwrap();
+        symlink(&outside, f.home.join(".local/share/Trash")).unwrap();
+        let r = empty_trash(&f.policy).err();
+        assert!(matches!(r, Some(Refusal::NoTrash(_))), "{r:?}");
+        assert!(outside.join("files/precious").exists());
+        // A data home out of the home (XDG_DATA_HOME elsewhere): refused, though its trash is
+        // the user's.
+        let data = f.t.0.join("data");
+        fs::create_dir_all(data.join("Trash/files")).unwrap();
+        fs::create_dir_all(data.join("Trash/info")).unwrap();
+        fs::write(data.join("Trash/files/x"), b"x").unwrap();
+        let config = f.home.join(".config");
+        let p = Policy::new(
+            me(),
+            None,
+            std::slice::from_ref(&f.home),
+            &data,
+            &config,
+            None,
+            None,
+        );
+        let r = empty_trash(&p).err();
+        let away = |e: &str| e.contains("not in your home");
+        assert!(matches!(&r, Some(Refusal::NoTrash(e)) if away(e)), "{r:?}");
+        assert!(data.join("Trash/files/x").exists());
+    }
+
     #[test]
     fn rule1_and_5_real_mounts_in_a_sandbox() {
         let t = TempDir::new("bwrap-guard");
@@ -1192,9 +1562,16 @@ mod tests {
             "root/plain",
             "root/plain2",
             "src",
+            "home3/.local/share/Trash/files/mnt",
+            "home3/.local/share/Trash/info",
+            "home4/.local/share/Trash/files",
+            "home4/.local/share/Trash/info",
         ] {
             fs::create_dir_all(t.0.join(d)).unwrap();
         }
+        let in_trash = t.0.join("home3/.local/share/Trash/files/mnt");
+        let as_files = t.0.join("home4/.local/share/Trash/files");
+        fs::write(t.0.join("home3/.local/share/Trash/files/plain"), b"f").unwrap();
         for f in ["src/f", "root/plain/f", "root/plain2/f", "root/sub/f"] {
             fs::write(t.0.join(f), b"f").unwrap();
         }
@@ -1214,6 +1591,10 @@ mod tests {
                 .args([&src, &bind])
                 .args(["--ro-bind", "/etc"])
                 .arg(&not_ours)
+                .arg("--tmpfs")
+                .arg(&in_trash)
+                .arg("--tmpfs")
+                .arg(&as_files)
                 .arg("--")
                 .args(cmd)
                 .env("TERMDISK_SANDBOX", &t.0)
@@ -1238,7 +1619,8 @@ mod tests {
     }
 
     /// Run by `rule1_and_5_real_mounts_in_a_sandbox` inside bwrap: `root/sub/tm` is a tmpfs,
-    /// `root/bind` a bind mount of `src` (same filesystem), `home2`'s `Trash/files` is /etc.
+    /// `root/bind` a bind mount of `src` (same filesystem), `home2`'s `Trash/files` is /etc,
+    /// `home3`'s `Trash/files/mnt` and `home4`'s `Trash/files` a tmpfs.
     #[test]
     #[ignore = "run inside bwrap by rule1_and_5_real_mounts_in_a_sandbox"]
     fn in_the_sandbox() {
@@ -1280,5 +1662,28 @@ mod tests {
             "{r:?}"
         );
         assert!(root.join("plain2/f").exists());
+        // A mount point in the trash: emptying leaves it, and what is on it (rule 13).
+        let files = t.join("home3/.local/share/Trash/files");
+        fs::write(files.join("mnt/on_tmpfs"), b"f").unwrap();
+        let out = empty_trash(&policy_for(&t.join("home3"), &t, None))
+            .unwrap()
+            .run(&Tally::default());
+        assert_eq!(out.items, 1, "{out:?}");
+        assert!(!files.join("plain").exists() && files.join("mnt/on_tmpfs").exists());
+        let mount = |p: &Path, why: &str| p.ends_with("mnt") && why.contains("mount point");
+        assert!(
+            matches!(&out.failed[..], [(p, why)] if mount(p, why)),
+            "{out:?}"
+        );
+        // A mount at the trash's `files` itself: refused, as moving into it would be.
+        let files = t.join("home4/.local/share/Trash/files");
+        fs::write(files.join("y"), b"y").unwrap();
+        let r = empty_trash(&policy_for(&t.join("home4"), &t, None)).err();
+        let at_files = |e: &str| e.contains("files folder is a mount point");
+        assert!(
+            matches!(&r, Some(Refusal::NoTrash(e)) if at_files(e)),
+            "{r:?}"
+        );
+        assert!(files.join("y").exists());
     }
 }

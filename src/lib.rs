@@ -4,10 +4,15 @@
 //! tree and shows it in a `View` drawn into a ratatui `Buffer`; it has no terminal code, so a
 //! host such as termcode can embed it.
 //!
-//! Embedding: give `View` the keys and clicks, `draw` it into the host's area (it draws
-//! nothing outside it), call `tick` when `next_wake` says, and act on the `Outcome`. The view
+//! Embedding: give `View` the keys and the mouse (clicks, moves, the wheel, and the left
+//! button's drags and releases: a drag over the tree's rows ticks them), `draw` it into the
+//! host's area (it draws nothing outside it), call `tick` when `next_wake` says, and act on
+//! the `Outcome`. The view
 //! asks before anything goes to the trash. `trash` itself does every safety check but asks
-//! nothing: a host that calls it directly must confirm with the user itself.
+//! nothing: a host that calls it directly must confirm with the user itself. With glibc, the
+//! memory a scan frees goes back to the system (`malloc_trim`) on the scan's thread, and when a
+//! scan again (`r`, or after a trash) drops the last tree, on the host's UI thread, in the
+//! `handle_key` or `handle_mouse` call that started it.
 
 mod draw;
 mod guard;

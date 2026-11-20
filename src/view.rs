@@ -9,6 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
@@ -17,10 +20,13 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::Rect;
 
-use crate::guard::{self, Policy};
+use crate::draw::count;
+use crate::guard::{self, Policy, Refusal};
 use crate::style::{Colors, IconSet};
 use crate::sys;
-use crate::tree::{Node, NodeId, Tree, HARDLINK_DUP, TRASHED};
+use crate::trash::{Emptied, Tally};
+use crate::tree::{Node, NodeId, Tree, HARDLINK_DUP, HOLDS, LOCKED, TRASHED};
+use crate::tree::{MOUNT, NOT_OWNED, PROTECTED, UNREADABLE};
 use crate::{scan, Scan};
 
 /// What the host should do after an event.
@@ -36,7 +42,8 @@ pub enum Outcome {
     CopyPath(PathBuf),
 }
 
-/// How long a new confirmation dialog takes only Cancel (keys typed ahead, a key held down).
+/// How long a new confirmation dialog can do nothing but close (keys typed ahead, a key held
+/// down): Tab moves the focus at once, but Enter on "Move to Trash" does nothing until then.
 pub(crate) const ARM: Duration = Duration::from_millis(500);
 /// How long the focus must have been on "Move to Trash" before Enter there moves the item.
 pub(crate) const REFOCUS: Duration = Duration::from_millis(150);
@@ -126,6 +133,9 @@ pub struct View {
     /// Where the mouse pointer was last seen, and what was under it in the last drawing.
     pub(crate) pointer: Option<(u16, u16)>,
     pub(crate) hover: Hover,
+    /// The trash is being scanned from the start screen's Del: its tree opens with the dialog
+    /// to empty it.
+    empty_next: bool,
 }
 
 /// What the pointer is over, as far as drawing it differently goes. Styling only: what a click
@@ -145,14 +155,38 @@ pub(crate) enum Hover {
     Move,
     /// The close button.
     Close,
+    /// The lock of this item, on its row or its tile (`Hits::locks`): a box says why it is
+    /// locked. A click there is a click on that row or tile.
+    Lock(NodeId),
+    /// The tick box of this item's row (`Hits::boxes`).
+    Box(NodeId),
 }
 
 pub(crate) enum Screen {
     Start(Start),
     Scanning(Scan),
     Browse(Box<Browse>),
+    /// The tree's folder scanned again (after a trash, or `r`). The last tree went when this
+    /// scan started, so two trees never share the memory (that doubled the peak); what it
+    /// showed waits by path, and `tick` shows the new tree that way (`Browse::restore`). Drawn
+    /// as a scan; keys and clicks wait but Esc, which stops it (back to the places, as for a
+    /// first scan: the last tree is gone), and `q`.
+    Refreshing(Scan, Saved),
     /// Only while one screen is being swapped for another.
     Gone,
+}
+
+/// What a tree showed, by path below its root (`Browse::save`), to show the next scan of the
+/// same folder the same way (`Browse::restore`).
+pub(crate) struct Saved {
+    /// The scanned folder, for the title meanwhile.
+    pub root: PathBuf,
+    zoom: PathBuf,
+    selected: PathBuf,
+    /// The selected row's line in the tree pane.
+    line: usize,
+    open: Vec<PathBuf>,
+    ticked: Vec<PathBuf>,
 }
 
 pub(crate) struct Start {
@@ -193,6 +227,46 @@ pub(crate) struct Browse {
     sorted: HashMap<NodeId, Vec<NodeId>>,
     /// The same in the tree's order.
     ordered: HashMap<NodeId, Vec<NodeId>>,
+    /// The ticked items (Space, a drag over the rows): Del moves these. Kept whatever is shown.
+    /// Only the top ones: an item in a ticked folder shows ticked and goes with it (`tidy`).
+    pub ticked: HashSet<NodeId>,
+    /// A drag over the rows going on: where it started and what was ticked before it.
+    drag: Option<Drag>,
+    /// The trash being emptied: what has gone so far (the tree is the one from before).
+    pub emptying: Option<Emptying>,
+}
+
+/// The trash being emptied, on a thread of its own. Dropping it (a host drops the view) stops
+/// it at the next entry, as dropping a `Scan` cancels it.
+pub(crate) struct Emptying {
+    pub tally: Arc<Tally>,
+    /// The items the trash held, as the scan saw it.
+    pub of: usize,
+    /// Taken once it has finished.
+    job: Option<JoinHandle<Emptied>>,
+}
+
+impl Emptying {
+    fn finished(&self) -> bool {
+        self.job.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+}
+
+impl Drop for Emptying {
+    fn drop(&mut self) {
+        self.tally.stop.store(true, Relaxed);
+    }
+}
+
+/// A drag with the left button over the tree's rows: it ticks the rows from the `anchor` item's
+/// to the one under the pointer, on top of `before`, once it has left the row it started on;
+/// started on a tick box, it gives them the state that box took (`on`). Any key and any new
+/// layout of the rows end it (`before` and the rows would be stale).
+struct Drag {
+    anchor: NodeId,
+    before: HashSet<NodeId>,
+    moved: bool,
+    on: bool,
 }
 
 /// Which handler a key goes to.
@@ -205,8 +279,15 @@ enum Mode {
 }
 
 pub(crate) struct Confirm {
-    pub id: NodeId,
-    pub path: PathBuf,
+    /// What goes, in this order, and the path shown for each. One item without refused ones
+    /// is the dialog for one; more (the ticked items) list every path.
+    pub items: Vec<(NodeId, PathBuf)>,
+    /// Ticked items the guard refused when the dialog opened, and why: listed, not moved.
+    pub refused: Vec<(PathBuf, String)>,
+    /// The items are the ticked ones, not the selected row (the dialog for one says so).
+    pub ticked: bool,
+    /// The dialog empties the trash (its one item is the trash's folder) for good.
+    pub empty: bool,
     pub opened: Instant,
     /// The focus is on "Move to Trash" (it starts on Cancel).
     pub on_move: bool,
@@ -214,26 +295,59 @@ pub(crate) struct Confirm {
     pub focused: Instant,
     /// The armed look has been drawn.
     pub shown_armed: bool,
-    /// The last drawing showed the whole path; until then (and while it cannot) the item
-    /// cannot be moved.
+    /// The last drawing showed the whole path, and for several items every path has been
+    /// shown whole once; until then (and while it cannot) nothing can be moved.
     pub fits: bool,
+    /// The list of several paths: its first line on screen; its lines on screen (PgUp); the
+    /// first line of the next page, which never splits a path that the last page cut (PgDn,
+    /// so reading page by page shows every path whole); whether each path has been shown
+    /// whole.
+    pub scroll: usize,
+    pub page: usize,
+    pub next_page: usize,
+    pub seen: Vec<bool>,
 }
 
 impl Confirm {
+    fn new(items: Vec<(NodeId, PathBuf)>, refused: Vec<(PathBuf, String)>) -> Self {
+        let now = Instant::now();
+        Confirm {
+            seen: vec![false; items.len()],
+            items,
+            refused,
+            ticked: false,
+            empty: false,
+            opened: now,
+            on_move: false,
+            focused: now,
+            shown_armed: false,
+            fits: false,
+            scroll: 0,
+            page: 1,
+            next_page: 1,
+        }
+    }
+
+    /// The dialog for one item, as without ticks.
+    pub fn one(&self) -> bool {
+        self.items.len() == 1 && self.refused.is_empty()
+    }
+
     pub fn armed(&self) -> bool {
         self.opened.elapsed() >= ARM
     }
 
     /// Whether a click on "Move to Trash" may move the item: armed and the whole path shown.
     /// The button is drawn disabled exactly when this is false (the keyboard's `REFOCUS` wait
-    /// is not shown).
+    /// is not shown); the focus may be on it meanwhile.
     pub fn clickable(&self) -> bool {
         self.armed() && self.fits
     }
 
     /// Whether Enter on "Move to Trash" may move the item now: armed, the whole path shown,
     /// and the focus there for `REFOCUS` (a Tab and an Enter in one burst, as pasted text
-    /// brings them where bracketed paste is missing, never confirm).
+    /// brings them where bracketed paste is missing, never confirm). Until then Enter there
+    /// does nothing and the dialog stays.
     pub fn may_move(&self) -> bool {
         self.on_move && self.armed() && self.fits && self.focused.elapsed() >= REFOCUS
     }
@@ -256,6 +370,10 @@ pub(crate) struct Hits {
     pub heads: Vec<(Rect, Field)>,
     /// The close button at the right of the title bar: a click on it presses `q`.
     pub close: Option<Rect>,
+    /// Each lock drawn, with the cell before it, and its item: the pointer there shows why.
+    pub locks: Vec<(Rect, NodeId)>,
+    /// Each tick box drawn whole (not the shown folder's), and its item: a click ticks it.
+    pub boxes: Vec<(Rect, NodeId)>,
 }
 
 impl View {
@@ -280,6 +398,7 @@ impl View {
             sort: Sort::default(),
             pointer: None,
             hover: Hover::Nothing,
+            empty_next: false,
         };
         match path {
             Some(p) => view.start_scan(p),
@@ -329,6 +448,52 @@ impl View {
         }
     }
 
+    /// Scans the tree's folder again (`Screen::Refreshing`): what the tree shows is kept by path
+    /// and the tree itself goes as the scan starts. If it cannot be scanned, nothing has gone:
+    /// the tree stays and the message says so (after what a trash just did, if it says that).
+    // ponytail: the whole folder, not only the one a trash changed: 0.3 s for 1.2 million
+    // entries warm. Rescan one folder and splice it in only if that ever shows (hard links
+    // across it, every NodeId held by the view).
+    fn refresh(&mut self) {
+        let b = match mem::replace(&mut self.screen, Screen::Gone) {
+            Screen::Browse(b) => b,
+            other => {
+                self.screen = other;
+                return;
+            }
+        };
+        let root = b.tree.root_path().to_path_buf();
+        self.screen = match scan(&root, self.policy.euid) {
+            Ok(s) => {
+                let saved = b.save();
+                drop(b);
+                sys::give_back_free_memory();
+                // The last drawing's tiles and locks were that tree's NodeIds.
+                self.forget_hits();
+                self.progress_drawn = Instant::now();
+                self.scan_started = self.progress_drawn;
+                Screen::Refreshing(s, saved)
+            }
+            Err(e) => {
+                let what = format!("scan {}: {e}", root.display());
+                self.message = Some(match self.message.take() {
+                    Some(m) => format!("{m}; cannot {what}"),
+                    None => format!("Cannot {what}"),
+                });
+                Screen::Browse(b)
+            }
+        };
+    }
+
+    /// A new tree replaces the last: what the last drawing found where (tiles, locks, tick
+    /// boxes: the last tree's NodeIds) means nothing until the next drawing.
+    fn forget_hits(&mut self) {
+        self.hits.tiles.clear();
+        self.hits.locks.clear();
+        self.hits.boxes.clear();
+        self.hover = Hover::Nothing;
+    }
+
     /// Moves a finished scan on to the tree, and arms a waiting dialog. Returns whether the
     /// screen changed (a running scan's progress does every `PROGRESS`).
     pub fn tick(&mut self) -> bool {
@@ -338,11 +503,45 @@ impl View {
                     Some(tree) => Screen::Browse(Box::new(self.browse(tree))),
                     None => Screen::Start(self.start()),
                 };
+                self.forget_hits();
+                if mem::take(&mut self.empty_next) && matches!(self.screen, Screen::Browse(_)) {
+                    self.ask_empty(0);
+                }
+            }
+            return true;
+        }
+        if let Screen::Browse(b) = &mut self.screen {
+            if let Some(mut e) = b.emptying.take_if(|e| e.finished()) {
+                self.message = Some(emptied(e.job.take().map(JoinHandle::join)));
+                self.done = true;
+                // Then from the disk, as for a move to the trash.
+                self.refresh();
+                return true;
+            }
+            if b.emptying.is_some() && self.progress_drawn.elapsed() >= PROGRESS {
+                self.progress_drawn = Instant::now();
+                return true;
+            }
+        }
+        if matches!(&self.screen, Screen::Refreshing(s, _) if s.is_finished()) {
+            if let Screen::Refreshing(s, saved) = mem::replace(&mut self.screen, Screen::Gone) {
+                self.screen = match s.join() {
+                    Some(tree) => {
+                        let mut b = self.browse(tree);
+                        b.restore(&saved);
+                        Screen::Browse(Box::new(b))
+                    }
+                    // Stopped: the last tree is gone, so the places, as after a first scan.
+                    None => Screen::Start(self.start()),
+                };
+                self.forget_hits();
             }
             return true;
         }
         match &mut self.screen {
-            Screen::Scanning(_) if self.progress_drawn.elapsed() >= PROGRESS => {
+            Screen::Scanning(_) | Screen::Refreshing(..)
+                if self.progress_drawn.elapsed() >= PROGRESS =>
+            {
                 self.progress_drawn = Instant::now();
                 true
             }
@@ -361,12 +560,12 @@ impl View {
     /// (the host may block until one comes).
     pub fn next_wake(&self) -> Option<Duration> {
         match &self.screen {
-            Screen::Scanning(_) => Some(SCAN_CHECK),
-            Screen::Browse(b) => b
-                .confirm
-                .as_ref()
-                .filter(|c| !c.shown_armed)
-                .map(|c| ARM.saturating_sub(c.opened.elapsed())),
+            Screen::Scanning(_) | Screen::Refreshing(..) => Some(SCAN_CHECK),
+            Screen::Browse(b) if b.emptying.is_some() => Some(SCAN_CHECK),
+            Screen::Browse(b) => {
+                let arm = b.confirm.as_ref().filter(|c| !c.shown_armed);
+                arm.map(|c| ARM.saturating_sub(c.opened.elapsed()))
+            }
             _ => None,
         }
     }
@@ -388,6 +587,9 @@ impl View {
             sort: self.sort,
             sorted: HashMap::new(),
             ordered: HashMap::new(),
+            ticked: HashSet::new(),
+            drag: None,
+            emptying: None,
         };
         b.rebuild(None);
         b.cursor = usize::from(b.rows.len() > 1);
@@ -406,6 +608,37 @@ impl View {
             self.help = false;
             return Outcome::Redraw;
         }
+        // Scanning again: Esc stops it, `q` quits; any other key waits, and leaves the message
+        // (what the trash did) on screen.
+        if let Screen::Refreshing(s, _) = &self.screen {
+            return match key.code {
+                KeyCode::Esc => {
+                    s.cancel();
+                    Outcome::None
+                }
+                KeyCode::Char('q') => Outcome::Quit,
+                _ => Outcome::None,
+            };
+        }
+        // Emptying the trash: Esc stops it (the item it is at stays in the trash, partly
+        // deleted), `q` quits; any other key waits.
+        if let Screen::Browse(b) = &self.screen {
+            if let Some(e) = &b.emptying {
+                return match key.code {
+                    KeyCode::Esc => {
+                        e.tally.stop.store(true, Relaxed);
+                        Outcome::Redraw
+                    }
+                    KeyCode::Char('q') => Outcome::Quit,
+                    _ => Outcome::None,
+                };
+            }
+        }
+        // A key ends a drag (the button held meanwhile): what it does may change the rows or
+        // the ticks the drag started from.
+        if let Screen::Browse(b) = &mut self.screen {
+            b.drag = None;
+        }
         let had_message = self.message.take().is_some();
         self.done = false;
         let mode = match &self.screen {
@@ -413,7 +646,7 @@ impl View {
             Screen::Scanning(_) => Mode::Scanning,
             Screen::Browse(b) if b.confirm.is_some() => Mode::Confirm,
             Screen::Browse(_) => Mode::Browse,
-            Screen::Gone => Mode::Gone,
+            Screen::Refreshing(..) | Screen::Gone => Mode::Gone,
         };
         let out = match mode {
             Mode::Start => self.start_key(key),
@@ -443,10 +676,31 @@ impl View {
             KeyCode::Up | KeyCode::Char('k') => s.sel = s.sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => s.sel = (s.sel + 1).min(s.places.len() - 1),
             KeyCode::Enter => return self.open_place(),
+            KeyCode::Delete => return self.empty_from_start(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('q') | KeyCode::Esc => return Outcome::Quit,
             _ => return Outcome::None,
         }
+        Outcome::Redraw
+    }
+
+    /// Del on the start screen's Trash: the trash is scanned (its size, a card meanwhile, Esc
+    /// stops it), then the dialog to empty it opens over its tree. Not when read-only.
+    fn empty_from_start(&mut self) -> Outcome {
+        let Screen::Start(s) = &self.screen else {
+            return Outcome::None;
+        };
+        let place = &s.places[s.sel];
+        let trash = self.policy.trash_dir();
+        if self.policy.read_only().is_some() || place.path != trash {
+            return Outcome::None;
+        }
+        if !place.exists {
+            self.message = Some("The trash is empty: there is none yet".into());
+            return Outcome::Redraw;
+        }
+        self.start_scan(&trash);
+        self.empty_next = matches!(self.screen, Screen::Scanning(_));
         Outcome::Redraw
     }
 
@@ -478,14 +732,14 @@ impl View {
             KeyCode::Home => b.cursor = 0,
             KeyCode::End => b.cursor = b.rows.len() - 1,
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('+') => {
-                if b.tree.node(sel).is_dir() && b.open.insert(sel) {
+                if b.open_folder(sel) {
                     b.rebuild(Some(sel));
-                } else if b.open.contains(&sel) && b.cursor + 1 < b.rows.len() {
+                } else if b.shows_open(sel) && b.cursor + 1 < b.rows.len() {
                     b.cursor += 1;
                 }
             }
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('-') => {
-                if sel != b.zoom && b.open.remove(&sel) {
+                if b.close_folder(sel) {
                     b.rebuild(Some(sel));
                 } else if let Some(p) = b.tree.parent(sel).filter(|_| sel != b.zoom) {
                     b.select(p);
@@ -520,10 +774,7 @@ impl View {
                 self.sort = self.sort.by(field);
                 b.resort(self.sort, sel);
             }
-            KeyCode::Char('r') => {
-                let root = b.tree.root_path().to_path_buf();
-                self.start_scan(&root);
-            }
+            KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('o') => return Outcome::Open(b.tree.path(sel)),
             KeyCode::Char('c') => {
                 self.message = Some(format!("Copied {}", b.tree.path(sel).display()));
@@ -532,7 +783,14 @@ impl View {
             KeyCode::Delete if !read_only => self.ask_trash(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('q') => return Outcome::Quit,
-            KeyCode::Esc => {}
+            // A tick on the row, or off it (not the shown folder's), and on to the next row.
+            KeyCode::Char(' ') => {
+                if sel != b.zoom {
+                    b.flip_tick(sel);
+                }
+                b.cursor = (b.cursor + 1).min(b.rows.len() - 1);
+            }
+            KeyCode::Esc => b.ticked.clear(),
             _ => return Outcome::None,
         }
         Outcome::Redraw
@@ -543,24 +801,134 @@ impl View {
         let Screen::Browse(b) = &mut self.screen else {
             return;
         };
+        if !b.ticked.is_empty() {
+            return self.ask_trash_ticked();
+        }
         let id = b.rows[b.cursor].0;
+        if b.tree.path(id) == self.policy.trash_dir() {
+            return self.ask_empty(id);
+        }
         // ponytail: `check` here and `trash` on confirm each walk the whole subtree on the
         // thread that draws: 10-20 ms for 10 000 entries warm, seconds for a huge folder read
         // cold. When that shows, run them on a worker thread (`trash` takes `&Tree` for it).
         if let Err(r) = guard::check(&b.tree, id, &self.policy) {
-            self.message = Some(format!("Cannot move to the trash: {r}"));
+            // A folder with no lock of its own: how many locked items the scan saw in it (the
+            // reason is still the guard's, from the disk).
+            let n = b.tree.node(id);
+            let held = match n.flags & (LOCKED | HOLDS) == HOLDS {
+                true => locked_inside(&b.tree, id),
+                false => 0,
+            };
+            let about_them = matches!(
+                r,
+                Refusal::Protected(_)
+                    | Refusal::NotOwned(_)
+                    | Refusal::Mount(_)
+                    | Refusal::Unreadable(_)
+            );
+            self.message = Some(match held {
+                1.. if about_them => {
+                    let s = if held == 1 { "" } else { "s" };
+                    format!("Cannot move to the trash: it holds {held} locked item{s}; {r}")
+                }
+                _ => format!("Cannot move to the trash: {r}"),
+            });
             return;
         }
-        let now = Instant::now();
-        b.confirm = Some(Confirm {
-            id,
-            path: b.tree.path(id),
-            opened: now,
-            on_move: false,
-            focused: now,
-            shown_armed: false,
-            fits: false,
+        b.confirm = Some(Confirm::new(vec![(id, b.tree.path(id))], Vec::new()));
+    }
+
+    /// The dialog for the ticked items (not the cursor's row), in path order, each checked by
+    /// the guard: what shows ticked is what may go. A ticked folder it passes goes whole. One
+    /// it refuses is listed with why and stays; if what is in it may still go (`opens`), each
+    /// item in it is asked on its own, and so on down. If it refuses them all, a message and
+    /// no dialog.
+    fn ask_trash_ticked(&mut self) {
+        let Screen::Browse(b) = &mut self.screen else {
+            return;
+        };
+        let tree = &b.tree;
+        let mut work: Vec<NodeId> = b
+            .ticked
+            .iter()
+            .copied()
+            .filter(|&id| !gone(tree, id))
+            .collect();
+        let (mut items, mut refused) = (Vec::new(), Vec::new());
+        while let Some(id) = work.pop() {
+            let path = tree.path(id);
+            match guard::check(tree, id, &self.policy) {
+                Ok(()) => items.push((id, path)),
+                Err(r) => {
+                    if tree.node(id).is_dir() && opens(&r, &path, &self.policy) {
+                        work.extend(tree.children(id).filter(|&c| !gone(tree, c)));
+                    }
+                    refused.push((path, r.to_string()));
+                }
+            }
+        }
+        items.sort_by(|a, b| a.1.cmp(&b.1));
+        refused.sort_by(|a, b| a.0.cmp(&b.0));
+        if items.is_empty() {
+            let first = refused.first().map_or("", |r| r.1.as_str());
+            self.message = Some(match refused.len() {
+                1 => format!("Cannot move to the trash: the ticked item cannot go; {first}"),
+                n => format!(
+                    "Cannot move to the trash: none of the {n} ticked items can go; {first}"
+                ),
+            });
+            return;
+        }
+        let mut c = Confirm::new(items, refused);
+        c.ticked = true;
+        b.confirm = Some(c);
+    }
+
+    /// The dialog to empty the trash, whose folder is `id`: how many items it holds and their
+    /// size, from the scan. If it holds nothing, or the guard says it cannot be emptied (the
+    /// checks make nothing), a message instead.
+    fn ask_empty(&mut self, id: NodeId) {
+        let Screen::Browse(b) = &mut self.screen else {
+            return;
+        };
+        if trash_items(&b.tree, id) == 0 {
+            self.message = Some("The trash is empty".into());
+            return;
+        }
+        if let Err(r) = guard::empty_trash(&self.policy) {
+            self.message = Some(format!("Cannot empty the trash: {r}"));
+            return;
+        }
+        let mut c = Confirm::new(vec![(id, b.tree.path(id))], Vec::new());
+        c.empty = true;
+        b.confirm = Some(c);
+    }
+
+    /// Empties the trash on a thread of its own, after the guard checks it again; the tree
+    /// waits under a card meanwhile (`tick` picks up the end).
+    fn start_empty(&mut self) {
+        let Screen::Browse(b) = &mut self.screen else {
+            return;
+        };
+        let Some(c) = b.confirm.take() else {
+            return;
+        };
+        let job = match guard::empty_trash(&self.policy) {
+            Ok(job) => job,
+            Err(r) => {
+                self.message = Some(format!("Cannot empty the trash: {r}"));
+                return;
+            }
+        };
+        let tally = Arc::new(Tally::default());
+        let shared = Arc::clone(&tally);
+        b.emptying = Some(Emptying {
+            tally,
+            of: trash_items(&b.tree, c.items[0].0),
+            job: Some(thread::spawn(move || job.run(&shared))),
         });
+        self.progress_drawn = Instant::now();
+        self.scan_started = self.progress_drawn;
     }
 
     fn confirm_key(&mut self, key: KeyEvent) -> Outcome {
@@ -573,17 +941,27 @@ impl View {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') => b.confirm = None,
             KeyCode::Enter if !c.on_move => b.confirm = None,
+            KeyCode::Enter if c.may_move() && c.empty => self.start_empty(),
             KeyCode::Enter if c.may_move() => self.do_trash(),
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right if c.armed() => {
+            // At once: only Enter waits (`may_move`).
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
                 c.on_move = !c.on_move;
                 c.focused = Instant::now();
             }
+            // The list of several paths (drawing keeps it in range).
+            KeyCode::Up => c.scroll = c.scroll.saturating_sub(1),
+            KeyCode::Down => c.scroll = c.scroll.saturating_add(1),
+            KeyCode::PageUp => c.scroll = c.scroll.saturating_sub(c.page),
+            KeyCode::PageDown => c.scroll = c.next_page.max(c.scroll.saturating_add(1)),
+            KeyCode::Home => c.scroll = 0,
+            KeyCode::End => c.scroll = usize::MAX,
             _ => return Outcome::None,
         }
         Outcome::Redraw
     }
 
-    /// Moves the item in the dialog to the trash (the guard checks it all again).
+    /// Moves the items in the dialog to the trash, one at a time, each through the guard,
+    /// which checks it all again. What it refuses stays (ticked, if it was).
     fn do_trash(&mut self) {
         let Screen::Browse(b) = &mut self.screen else {
             return;
@@ -591,39 +969,76 @@ impl View {
         let Some(c) = b.confirm.take() else {
             return;
         };
-        let n = *b.tree.node(c.id);
-        let size = crate::fmt_size(if self.apparent { n.apparent } else { n.alloc });
-        let what = if n.is_dir() {
-            format!("{} items, {size}", n.items)
-        } else {
-            size
-        };
-        let name = crate::draw::shown(b.tree.name(c.id));
+        let (mut moved, mut bytes, mut refused) = (0, 0, Vec::new());
+        let mut what = String::new();
+        for &(id, _) in &c.items {
+            let (n, items) = (*b.tree.node(id), b.tree.items(id));
+            let size = if self.apparent { n.apparent } else { n.alloc };
+            match guard::trash(&b.tree, id, &self.policy) {
+                Ok(_) => {
+                    b.tree.mark_trashed(id);
+                    (moved, bytes) = (moved + 1, bytes + size);
+                    let size = crate::fmt_size(size);
+                    let name = crate::draw::shown(b.tree.name(id));
+                    what = match n.is_dir() {
+                        true => format!("{name}, {}, {size}", count(items.into(), "item")),
+                        false => format!("{name}, {size}"),
+                    };
+                }
+                Err(r) => refused.push(r),
+            }
+        }
         // Shown until the next key or click (no timer); that key or click also does its own
         // work, as with every message.
-        self.message = Some(match guard::trash(&b.tree, c.id, &self.policy) {
-            Ok(_) => {
-                self.done = true;
-                b.tree.mark_trashed(c.id);
-                b.sorted.clear();
-                b.ordered.clear();
-                if c.id == b.zoom {
-                    b.zoom = b.tree.parent(c.id).unwrap_or(0);
-                }
-                let at = b.cursor;
-                b.rebuild(None);
-                b.cursor = at.min(b.rows.len() - 1);
-                format!("Moved to the trash: {name}, {what} - freed when the trash is emptied")
-            }
-            Err(r) => format!("Not moved: {r}"),
-        });
+        let freed = "freed when the trash is emptied";
+        let mut msg = match (c.one(), moved) {
+            (true, 1) => format!("Moved to the trash: {what} - {freed}"),
+            (_, 0) => String::new(),
+            _ => format!(
+                "Moved {} to the trash, {} - {freed}",
+                count(moved, "item"),
+                crate::fmt_size(bytes)
+            ),
+        };
+        if let Some(r) = refused.first() {
+            msg = match (moved, c.one()) {
+                (0, true) => format!("Not moved: {r}"),
+                (0, false) => format!("None moved: {} refused; {r}", refused.len()),
+                _ => format!("{msg}; {} not moved: {r}", refused.len()),
+            };
+        }
+        self.message = Some(msg);
+        if moved == 0 {
+            return;
+        }
+        self.done = true;
+        let tree = &b.tree;
+        b.ticked.retain(|&id| !gone(tree, id));
+        b.sorted.clear();
+        b.ordered.clear();
+        while b.zoom != 0 && gone(&b.tree, b.zoom) {
+            b.zoom = b.tree.parent(b.zoom).unwrap_or(0);
+        }
+        let at = b.cursor;
+        b.rebuild(None);
+        b.cursor = at.min(b.rows.len() - 1);
+        // Then from the disk, as it is now: what this tree shows as the trash left it (the row
+        // after the one that went selected) is kept by path, and the new tree shows it so.
+        self.refresh();
     }
 
+    /// A mouse event: give the view every one, the left button's drags and releases too (a
+    /// drag over the tree's rows ticks them; the CLI's terminal reports them with any-event
+    /// tracking, as crossterm's `EnableMouseCapture` turns on).
     pub fn handle_mouse(&mut self, m: MouseEvent) -> Outcome {
         let (x, y) = (m.column, m.row);
         let inside = |r: Rect| x >= r.x && x < r.right() && y >= r.y && y < r.bottom();
         match m.kind {
-            MouseEventKind::Down(MouseButton::Left) => {}
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Screen::Browse(b) = &mut self.screen {
+                    b.drag = None; // a row below may start one again
+                }
+            }
             // Drawn again only when what is under the pointer changes.
             MouseEventKind::Moved => {
                 self.pointer = Some((x, y));
@@ -637,7 +1052,15 @@ impl View {
                 let up = m.kind == MouseEventKind::ScrollUp;
                 let tree = inside(self.hits.rows) || inside(self.hits.scrollbar);
                 if let Screen::Browse(b) = &mut self.screen {
-                    if b.confirm.is_none() && tree {
+                    // Over the dialog: its list of paths (drawing keeps it in range).
+                    if let Some(c) = &mut b.confirm {
+                        c.scroll = match up {
+                            true => c.scroll.saturating_sub(3),
+                            false => c.scroll.saturating_add(3),
+                        };
+                        return Outcome::Redraw;
+                    }
+                    if tree {
                         b.cursor = match up {
                             true => b.cursor.saturating_sub(3),
                             false => (b.cursor + 3).min(b.rows.len() - 1),
@@ -647,21 +1070,43 @@ impl View {
                 }
                 return Outcome::None;
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.pointer = Some((x, y));
+                return self.drag_to(y);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Screen::Browse(b) = &mut self.screen {
+                    b.drag = None;
+                }
+                return Outcome::None;
+            }
             _ => return Outcome::None,
         }
         let now = Instant::now();
         let double = self
             .last_click
             .is_some_and(|(t, cx, cy)| now - t < DOUBLE && (cx, cy) == (x, y));
+        // A row's tick box: each click there ticks or unticks, none is part of a double click.
+        let tick_box = self.hits.boxes.iter().find(|b| inside(b.0)).map(|b| b.1);
         // A double click is used up: a third quick click starts over as a single one.
-        self.last_click = if double { None } else { Some((now, x, y)) };
+        self.last_click = match double || tick_box.is_some() {
+            true => None,
+            false => Some((now, x, y)),
+        };
         if self.help {
             self.help = false;
             return Outcome::Redraw;
         }
         if self.hits.close.is_some_and(inside) {
-            // Whatever `q` does here: quit, or nothing under the dialog.
-            return self.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+            // Quits, as `q` does; under the dialog, nothing (and it shows no hover there).
+            return match self.close_works() {
+                true => Outcome::Quit,
+                false => Outcome::None,
+            };
+        }
+        let emptying = matches!(&self.screen, Screen::Browse(b) if b.emptying.is_some());
+        if matches!(self.screen, Screen::Refreshing(..)) || emptying {
+            return Outcome::None; // waits, as keys do, and leaves the message
         }
         self.message = None;
         self.done = false;
@@ -690,8 +1135,11 @@ impl View {
                 };
                 // A click is aimed: no wait for the focus, but armed and the whole path shown.
                 let ok = b.confirm.as_ref().is_some_and(Confirm::clickable);
+                let empty = b.confirm.as_ref().is_some_and(|c| c.empty);
                 if inside(cancel) {
                     b.confirm = None;
+                } else if inside(moving) && ok && empty {
+                    self.start_empty();
                 } else if inside(moving) && ok {
                     self.do_trash();
                 } else {
@@ -703,6 +1151,23 @@ impl View {
                 self.sort = head.map_or(self.sort, |f| self.sort.by(f));
                 b.resort(self.sort, sel);
             }
+            Screen::Browse(b) if tick_box.is_some() => {
+                // Ticked or not, with the cursor on its row; a drag from here gives the rows it
+                // goes over the state this box took.
+                let Some(id) = tick_box else {
+                    return Outcome::None;
+                };
+                if let Some(row) = b.rows.iter().position(|r| r.0 == id) {
+                    b.cursor = row;
+                    let on = b.flip_tick(id);
+                    b.drag = Some(Drag {
+                        anchor: id,
+                        before: b.ticked.clone(),
+                        moved: false,
+                        on,
+                    });
+                }
+            }
             Screen::Browse(b) if inside(self.hits.rows) => {
                 let row = b.top + usize::from(y - self.hits.rows.y);
                 if row < b.rows.len() {
@@ -710,6 +1175,14 @@ impl View {
                     if double {
                         b.toggle(b.rows[row].0);
                     }
+                    // A drag may start here.
+                    let (anchor, before) = (b.rows[b.cursor].0, b.ticked.clone());
+                    b.drag = Some(Drag {
+                        anchor,
+                        before,
+                        moved: false,
+                        on: true,
+                    });
                 }
             }
             Screen::Browse(b) => {
@@ -734,6 +1207,59 @@ impl View {
             }
             _ => return Outcome::None,
         }
+        Outcome::Redraw
+    }
+
+    /// The pointer dragged with the left button to line `y`: once it has left the row the drag
+    /// started on, the rows from there to the one under it are ticked (on top of what was
+    /// ticked before; dragging back takes ticks off again), or unticked if it started on a box
+    /// it unticked (`tick_on`, `tick_off`: a row in a ticked folder is ticked already, and
+    /// unticking it splits that folder's tick); the shown folder's row never, and the cursor
+    /// follows. Above or below the
+    /// rows, the next row past the edge: the list scrolls as the cursor goes.
+    fn drag_to(&mut self, y: u16) -> Outcome {
+        let rows = self.hits.rows;
+        let Screen::Browse(b) = &mut self.screen else {
+            return Outcome::None;
+        };
+        let Some(d) = b.drag.as_mut().filter(|_| b.confirm.is_none()) else {
+            return Outcome::None;
+        };
+        let Some(anchor) = b.rows.iter().position(|r| r.0 == d.anchor) else {
+            b.drag = None; // its row is gone
+            return Outcome::None;
+        };
+        let last = b.rows.len() - 1;
+        let row = match y {
+            y if y < rows.y => b.top.saturating_sub(1),
+            y if y >= rows.bottom() => b.top + usize::from(rows.height),
+            y => b.top + usize::from(y - rows.y),
+        };
+        let row = row.min(last);
+        if row == anchor && !d.moved {
+            return Outcome::None;
+        }
+        d.moved = true;
+        let (on, before) = (d.on, d.before.clone());
+        let range = anchor.min(row)..=anchor.max(row);
+        let zoom = b.zoom;
+        let rows: Vec<NodeId> = b.rows[range].iter().map(|r| r.0).collect();
+        // From the top down, so a folder comes before what is in it. Off over a folder holding
+        // ticks (◩) takes those off too: each row ends as the drag paints it.
+        b.ticked = before;
+        let part = match on {
+            true => HashSet::new(),
+            false => b.partly_ticked(),
+        };
+        for id in rows.into_iter().filter(|&id| id != zoom) {
+            match on {
+                true => b.tick_on(id),
+                false if part.contains(&id) && !b.shows_ticked(id) => b.clear_below(id),
+                false => b.tick_off(id),
+            }
+        }
+        b.tidy();
+        b.cursor = row;
         Outcome::Redraw
     }
 
@@ -769,6 +1295,13 @@ impl View {
             Screen::Browse(_) if h.heads.iter().any(|i| inside(i.0)) => {
                 Hover::Head(h.heads.iter().position(|i| inside(i.0)).unwrap_or(0))
             }
+            // A lock lies on its row or tile: looked for first, the click goes to those.
+            Screen::Browse(_) if h.locks.iter().any(|l| inside(l.0)) => {
+                Hover::Lock(h.locks.iter().find(|l| inside(l.0)).map_or(0, |l| l.1))
+            }
+            Screen::Browse(_) if h.boxes.iter().any(|b| inside(b.0)) => {
+                Hover::Box(h.boxes.iter().find(|b| inside(b.0)).map_or(0, |b| b.1))
+            }
             Screen::Browse(b) if inside(h.rows) => match b.top + usize::from(y - h.rows.y) {
                 row if row < b.rows.len() => Hover::Row(row),
                 _ => Hover::Nothing,
@@ -799,6 +1332,123 @@ impl View {
     }
 }
 
+/// Whether the guard's refusal `r` of the folder at `path` leaves what is in it to be asked on
+/// its own: the refusal names something inside it, or the folder protects only itself
+/// (`~/.cache`, Downloads). Not when the folder itself is not the user's, a mount point,
+/// unreadable or a wholly protected folder or in one (its items would be refused too), nor
+/// for a refusal of any move (read-only, another filesystem, no trash, changed); never a home
+/// (a ticked home would tick all in it that may go).
+fn opens(r: &Refusal, path: &Path, policy: &Policy) -> bool {
+    if policy.is_home(path) || matches!(policy.protection(path), Some((_, true, _))) {
+        return false;
+    }
+    match r {
+        Refusal::Protected(p)
+        | Refusal::NotOwned(p)
+        | Refusal::Mount(p)
+        | Refusal::Unreadable(p)
+            if p != path && p.starts_with(path) =>
+        {
+            true
+        }
+        Refusal::Protected(_) => matches!(policy.protection(path), Some((_, false, true))),
+        _ => false,
+    }
+}
+
+/// How many items the trash whose folder is `id` holds: what is in its `files`, as scanned.
+pub(crate) fn trash_items(tree: &Tree, id: NodeId) -> usize {
+    let mut kids = tree.children(id);
+    let files = kids.find(|&c| tree.name(c) == "files" && tree.node(c).is_dir());
+    files.map_or(0, |f| tree.children(f).filter(|&c| !gone(tree, c)).count())
+}
+
+/// The status bar's message for what emptying the trash did.
+fn emptied(done: Option<thread::Result<Emptied>>) -> String {
+    let Some(Ok(e)) = done else {
+        return "Emptying the trash stopped: it failed; what is left is still in the trash".into();
+    };
+    let freed = crate::fmt_size(e.bytes);
+    let items = count(e.items, "item");
+    let mut msg = match e.stopped {
+        false => format!("Emptied the trash: {items} deleted, {freed} freed"),
+        true => {
+            format!("Stopped emptying the trash: {items} deleted, {freed} freed; the rest stays")
+        }
+    };
+    if let Some((path, why)) = e.failed.first() {
+        let n = e.failed.len();
+        msg.push_str(&format!("; {n} not deleted: {}: {why}", path.display()));
+    }
+    msg
+}
+
+/// Whether `id` went to the trash, itself or with a folder above it.
+fn gone(tree: &Tree, id: NodeId) -> bool {
+    let mut up = Some(id);
+    while let Some(i) = up {
+        if tree.node(i).flags & TRASHED != 0 {
+            return true;
+        }
+        up = tree.parent(i);
+    }
+    false
+}
+
+/// How many locked items the scan saw under `id`, counting the top one of a locked subtree
+/// once (only folders that hold one are looked into).
+fn locked_inside(tree: &Tree, id: NodeId) -> usize {
+    let (mut count, mut stack) = (0, vec![id]);
+    while let Some(i) = stack.pop() {
+        for k in tree.children(i) {
+            let flags = tree.node(k).flags;
+            if flags & TRASHED != 0 {
+                continue;
+            }
+            if flags & LOCKED != 0 {
+                count += 1;
+            } else if flags & HOLDS != 0 {
+                stack.push(k);
+            }
+        }
+    }
+    count
+}
+
+/// Why `id` itself cannot be trashed, as the scan saw it, for the box over its lock: each of its
+/// locks, in the order the guard checks them. Only the tree's flags and the policy's paths: it
+/// runs while drawing, so it never asks the disk or the user database (a hung mount or a slow
+/// NSS would freeze the view).
+pub(crate) fn lock_reason(tree: &Tree, id: NodeId, policy: &Policy) -> String {
+    let flags = tree.node(id).flags;
+    let path = tree.path(id);
+    // A path as shown, under the home as `~/...`.
+    let show = |p: &Path| match p.strip_prefix(policy.home()) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", crate::draw::shown(rest.as_os_str())),
+        Err(_) => crate::draw::shown(p.as_os_str()),
+    };
+    let mut why = Vec::new();
+    if flags & PROTECTED != 0 {
+        why.push(match policy.protection(&path) {
+            Some((p, true, true)) => format!("protected: {}, with everything in it", show(p)),
+            Some((p, false, _)) => format!("protected: {} (what is in it may go)", show(p)),
+            Some((p, true, false)) => format!("protected: inside {}", show(p)),
+            None => "protected".to_string(),
+        });
+    }
+    if flags & MOUNT != 0 {
+        why.push(format!("a mount point: {}", show(&path)));
+    }
+    if flags & NOT_OWNED != 0 {
+        why.push("not yours: another user owns it".to_string());
+    }
+    if flags & UNREADABLE != 0 {
+        why.push("could not be read".to_string());
+    }
+    why.join("; ")
+}
+
 /// What a node adds to its folder's total in this mode (a repeated hard link adds nothing).
 pub(crate) fn counted(n: &Node, apparent: bool) -> u64 {
     match (n.flags & HARDLINK_DUP != 0, apparent) {
@@ -823,15 +1473,16 @@ impl Browse {
     }
 
     /// Lays the rows out again from `zoom` down through the open folders, keeping the cursor
-    /// on `keep` if it is still shown.
+    /// on `keep` if it is still shown. A drag going on ends: its rows are gone.
     fn rebuild(&mut self, keep: Option<NodeId>) {
+        self.drag = None;
         let mut rows = Vec::new();
         let mut stack = vec![(self.zoom, 0u16)];
         while let Some((id, depth)) = stack.pop() {
             rows.push((id, depth));
             if self.open.contains(&id) || id == self.zoom {
-                let kids = self.ordered(id);
-                stack.extend(kids.into_iter().rev().map(|k| (k, depth + 1)));
+                let kids = self.ordered(id).into_iter().rev();
+                stack.extend(kids.map(|k| (k, depth + 1)));
             }
         }
         self.rows = rows;
@@ -853,15 +1504,26 @@ impl Browse {
         if id == self.zoom || !self.tree.node(id).is_dir() {
             return;
         }
-        if !self.open.remove(&id) {
-            self.open.insert(id);
+        if !self.close_folder(id) {
+            self.open_folder(id);
         }
         self.rebuild(Some(id));
     }
 
-    /// Puts the cursor on `id`, opening the folders above it as needed.
+    /// Opens the folder `id` if it is closed; whether it was. Lays nothing out.
+    fn open_folder(&mut self, id: NodeId) -> bool {
+        self.tree.node(id).is_dir() && self.open.insert(id)
+    }
+
+    /// Closes the folder `id` if it is open; whether it was. The shown folder stays open. Lays
+    /// nothing out.
+    fn close_folder(&mut self, id: NodeId) -> bool {
+        id != self.zoom && self.open.remove(&id)
+    }
+
+    /// Puts the cursor on `id`, opening the folders between the shown one and it.
     pub fn select(&mut self, id: NodeId) {
-        let mut up = self.tree.parent(id);
+        let mut up = self.tree.parent(id).filter(|_| id != self.zoom);
         while let Some(p) = up {
             self.open.insert(p);
             if p == self.zoom {
@@ -875,6 +1537,129 @@ impl Browse {
         if let Some(i) = self.rows.iter().position(|r| r.0 == id) {
             self.cursor = i;
         }
+    }
+
+    /// Whether a folder above `id` is ticked (`id` goes with it).
+    fn ticked_above(&self, id: NodeId) -> bool {
+        let mut up = self.tree.parent(id);
+        while let Some(p) = up {
+            if self.ticked.contains(&p) {
+                return true;
+            }
+            up = self.tree.parent(p);
+        }
+        false
+    }
+
+    /// Whether the row of `id` shows ticked: it is, or a folder above it is (it goes with it).
+    pub fn shows_ticked(&self, id: NodeId) -> bool {
+        self.ticked.contains(&id) || self.ticked_above(id)
+    }
+
+    /// Ticks `id` (Space, its box) or takes the tick off; returns whether it shows ticked now.
+    fn flip_tick(&mut self, id: NodeId) -> bool {
+        let on = !self.shows_ticked(id);
+        match on {
+            true => self.tick_on(id),
+            false => self.tick_off(id),
+        }
+        self.tidy();
+        on
+    }
+
+    /// Ticks `id`, with everything in it; nothing changes in a ticked folder. `tidy` then drops
+    /// the ticks it holds.
+    fn tick_on(&mut self, id: NodeId) {
+        if !self.shows_ticked(id) {
+            self.ticked.insert(id);
+        }
+    }
+
+    /// Takes the tick off `id` and everything in it. In a ticked folder, that folder's tick is
+    /// split: it goes, and each other item on the way down to `id` is ticked on its own (not
+    /// what went to the trash), so all but `id` stays ticked.
+    fn tick_off(&mut self, id: NodeId) {
+        if self.ticked.remove(&id) {
+            return;
+        }
+        let mut path = vec![id];
+        let mut up = self.tree.parent(id);
+        while let Some(p) = up {
+            if self.ticked.remove(&p) {
+                // ponytail: a tick per item beside the path: unticking one of 200 000 files in
+                // a ticked folder makes 199 999 ticks. Keep "all but these" if that shows.
+                let mut parent = p;
+                for &next in path.iter().rev() {
+                    for c in self.tree.children(parent) {
+                        if c != next && !gone(&self.tree, c) {
+                            self.ticked.insert(c);
+                        }
+                    }
+                    parent = next;
+                }
+                return;
+            }
+            path.push(p);
+            up = self.tree.parent(p);
+        }
+    }
+
+    /// Takes off the ticks inside the folder `id` (a drag that takes ticks off, over a folder
+    /// holding some: it ends with none).
+    fn clear_below(&mut self, id: NodeId) {
+        let lies_in = |t: NodeId| {
+            let mut up = self.tree.parent(t);
+            while let Some(p) = up.filter(|&p| p != id) {
+                up = self.tree.parent(p);
+            }
+            up.is_some()
+        };
+        let below: Vec<NodeId> = self
+            .ticked
+            .iter()
+            .copied()
+            .filter(|&t| lies_in(t))
+            .collect();
+        for t in below {
+            self.ticked.remove(&t);
+        }
+    }
+
+    /// Drops the ticks inside a ticked folder (they go with it), so `ticked` holds only the top
+    /// ones: what its count says, and what Del lists.
+    fn tidy(&mut self) {
+        let inside: Vec<NodeId> = (self.ticked.iter().copied())
+            .filter(|&id| self.ticked_above(id))
+            .collect();
+        for id in inside {
+            self.ticked.remove(&id);
+        }
+    }
+
+    /// The folders holding a ticked item, drawn ◩ where not ticked themselves: each ticked
+    /// item's folders above it, up to one met already.
+    pub fn partly_ticked(&self) -> HashSet<NodeId> {
+        let mut part = HashSet::new();
+        for &id in &self.ticked {
+            let mut up = self.tree.parent(id);
+            while let Some(p) = up.filter(|&p| part.insert(p)) {
+                up = self.tree.parent(p);
+            }
+        }
+        part
+    }
+
+    /// What the ticked items add up to in this mode (`ticked` holds only the top ones).
+    pub fn ticked_size(&self, apparent: bool) -> u64 {
+        let ticked = self.ticked.iter();
+        ticked
+            .map(|&id| counted(self.tree.node(id), apparent))
+            .sum()
+    }
+
+    /// Whether the row of `id` shows its folder open (the chevron).
+    pub fn shows_open(&self, id: NodeId) -> bool {
+        id == self.zoom || self.open.contains(&id)
     }
 
     fn zoom_in(&mut self, id: NodeId) {
@@ -895,6 +1680,57 @@ impl Browse {
         let was = self.zoom;
         self.zoom = up;
         self.rebuild(Some(was));
+    }
+
+    /// What this shows, by path below the root, for `restore` on the next scan of the folder.
+    /// Paths below the root: the folder may be reached by another path next time (a symlink put
+    /// where it was), so its absolute path may differ.
+    fn save(&self) -> Saved {
+        let tree = &self.tree;
+        let below = |id: NodeId| {
+            let path = tree.path(id);
+            path.strip_prefix(tree.root_path())
+                .map_or_else(|_| PathBuf::new(), Path::to_path_buf)
+        };
+        let all = |ids: &HashSet<NodeId>| ids.iter().map(|&id| below(id)).collect();
+        Saved {
+            root: tree.root_path().to_path_buf(),
+            zoom: below(self.zoom),
+            selected: below(self.rows[self.cursor].0),
+            line: self.cursor.saturating_sub(self.top),
+            open: all(&self.open),
+            ticked: all(&self.ticked),
+        }
+    }
+
+    /// Shows what the previous scan of the same folder showed (`save`): the same folder, the
+    /// same folders open, the same item selected on the same line. Where one
+    /// is gone, the nearest folder above it that is still there.
+    fn restore(&mut self, saved: &Saved) {
+        let tree = &self.tree;
+        let here = |path: &PathBuf| tree.find(path);
+        // The empty path, the root, is always there.
+        let nearest = |path: &Path| path.ancestors().find_map(|p| tree.find(p)).unwrap_or(0);
+        let is_dir = |id: &NodeId| tree.node(*id).is_dir();
+        // A shown folder that is a file now: the folder holding it.
+        let mut zoom = nearest(&saved.zoom);
+        while zoom != 0 && !is_dir(&zoom) {
+            zoom = tree.parent(zoom).unwrap_or(0);
+        }
+        let selected = nearest(&saved.selected);
+        let open = saved.open.iter().filter_map(here).filter(is_dir);
+        let open: HashSet<NodeId> = open.chain([0, zoom]).collect();
+        // Ticked items still there, at the same path (not a folder above one that went). Ticks
+        // pick what Del moves, so where the folder itself was swapped (a symlink put where it
+        // was), a path below it may now be something else: none stay.
+        let ticked: HashSet<NodeId> = match tree.root_path() == saved.root {
+            true => saved.ticked.iter().filter_map(here).collect(),
+            false => HashSet::new(),
+        };
+        (self.ticked, self.open, self.zoom) = (ticked, open, zoom);
+        self.tidy();
+        self.rebuild(Some(selected));
+        self.top = self.cursor.saturating_sub(saved.line);
     }
 
     /// The treemap's folder and its selected tile: the folder that holds the selected row, and
@@ -922,7 +1758,7 @@ impl Browse {
             let order = match sort.by {
                 Field::Name => by_name(tree.name(a).as_bytes(), tree.name(b).as_bytes()),
                 Field::Size => counted(x, apparent).cmp(&counted(y, apparent)),
-                Field::Items => x.items.cmp(&y.items), // a file has none
+                Field::Items => tree.items(a).cmp(&tree.items(b)), // a file has none
                 Field::Modified => x.mtime.cmp(&y.mtime),
             };
             let order = if sort.descending {
@@ -1042,11 +1878,32 @@ mod tests {
         })
     }
 
+    /// The tree on screen.
     fn browse(v: &mut View) -> &mut Browse {
         match &mut v.screen {
             Screen::Browse(b) => b,
             _ => panic!("not browsing"),
         }
+    }
+
+    /// What the last tree showed, kept by path while its folder is scanned again.
+    fn saved(v: &View) -> &Saved {
+        match &v.screen {
+            Screen::Refreshing(_, saved) => saved,
+            _ => panic!("not scanning again"),
+        }
+    }
+
+    /// Ticks until a scan again (after a trash, or `r`) has shown its tree.
+    fn settle(v: &mut View) {
+        for _ in 0..5000 {
+            v.tick();
+            if matches!(v.screen, Screen::Browse(_)) {
+                return;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        panic!("the scan again did not finish");
     }
 
     fn selected_name(v: &mut View) -> String {
@@ -1077,7 +1934,7 @@ mod tests {
         );
         let lines = text(&mut v, 120, 40);
         assert!(has(&lines, "Name") && has(&lines, "Size") && has(&lines, "Modified"));
-        assert!(has(&lines, "▸ big/") && has(&lines, "small"));
+        assert!(has(&lines, "▸ ☐ big/") && has(&lines, "☐ small"));
         let map: Vec<String> = lines.iter().map(|l| l.chars().skip(62).collect()).collect();
         assert!(has(&map, "big/"), "the treemap names the folder: {map:?}");
         assert!(has(&lines, "Del trash"));
@@ -1107,7 +1964,8 @@ mod tests {
     }
 
     #[test]
-    fn rule7_only_cancel_for_half_a_second_then_tab_enter_moves_it() {
+    fn rule7_tab_moves_the_focus_at_once_and_enter_waits_half_a_second() {
+        use ratatui::style::Modifier;
         let (_t, home) = home("view-arm");
         let mut v = ready(policy(&home, None), &home.join(".cache"));
         let before = browse(&mut v).tree.node(0).alloc;
@@ -1116,27 +1974,31 @@ mod tests {
             v.next_wake().is_some_and(|d| d <= ARM),
             "wakes to arm the dialog"
         );
-        key(&mut v, KeyCode::Tab); // too soon: ignored
-        key(&mut v, KeyCode::Enter); // still on Cancel
-        assert!(browse(&mut v).confirm.is_none() && home.join(".cache/big").exists());
-        key(&mut v, KeyCode::Delete);
+        key(&mut v, KeyCode::Tab); // at once
+        assert!(browse(&mut v).confirm.as_ref().unwrap().on_move);
+        // Drawn with the focus (bold, Cancel not), and crossed out: it cannot move yet.
+        let buf = draw_buf(&mut v, 120, 40);
+        let (cancel, moving) = v.hits.buttons.unwrap();
+        assert!(mods(&buf, moving).contains(Modifier::BOLD | Modifier::CROSSED_OUT));
+        assert!(!mods(&buf, cancel).contains(Modifier::BOLD));
+        key(&mut v, KeyCode::Enter); // too soon: nothing, and the dialog stays
+        assert!(browse(&mut v).confirm.is_some() && home.join(".cache/big").exists());
+        // Del, Tab, a wait, Enter: moved.
         age(&mut v);
         assert!(v.tick(), "draws the armed dialog once");
         assert_eq!(v.next_wake(), None);
-        key(&mut v, KeyCode::Tab);
-        browse(&mut v).confirm.as_mut().unwrap().focused -= REFOCUS;
         key(&mut v, KeyCode::Enter);
         let trash = home.join(".local/share/Trash");
         assert!(!home.join(".cache/big").exists());
         assert!(trash.join("files/big/inner/f19").exists());
         assert!(trash.join("info/big.trashinfo").exists());
+        // The scan's card meanwhile, with the message; then the tree from the disk, without it.
+        assert!(has(&text(&mut v, 120, 40), "Moved to the trash"));
+        settle(&mut v);
         let lines = text(&mut v, 120, 40);
-        assert!(has(&lines, "Moved to the trash"));
+        assert!(has(&lines, "Moved to the trash"), "until a key or a click");
         assert!(!has(&lines, "big/"), "gone from the tree and the map");
-        assert!(
-            browse(&mut v).tree.node(0).alloc < before,
-            "sizes updated without a rescan"
-        );
+        assert!(browse(&mut v).tree.node(0).alloc < before, "sizes updated");
     }
 
     /// Ages the open dialog past every delay, and draws it (its whole path is then shown).
@@ -1414,7 +2276,63 @@ mod tests {
             hovered.push(v);
         }
         views.extend(hovered);
+        // The pointer on a lock: its reason in a box.
+        let mut tip = ready(policy(home, None), home);
+        text(&mut tip, 120, 40);
+        let lock = tip.hits.locks[0].0;
+        hover(&mut tip, lock.x + 1, lock.y);
+        assert!(matches!(tip.hover, Hover::Lock(_)));
+        views.push(tip);
+        // Ticks and the status line; the dialog for them (a path, a refused one).
+        for dialog in [false, true] {
+            let mut ticks = ready(policy(home, None), home);
+            let small = browse(&mut ticks).tree.find(&cache.join("small")).unwrap();
+            browse(&mut ticks).select(small);
+            key(&mut ticks, KeyCode::Char(' '));
+            select(&mut ticks, ".config");
+            key(&mut ticks, KeyCode::Char(' '));
+            if dialog {
+                key(&mut ticks, KeyCode::Delete);
+                assert!(browse(&mut ticks).confirm.is_some());
+            }
+            views.push(ticks);
+        }
         views
+    }
+
+    fn mouse(v: &mut View, kind: MouseEventKind, x: u16, y: u16) -> Outcome {
+        v.handle_mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// The names of the ticked items, A to Z.
+    fn ticked(v: &mut View) -> Vec<String> {
+        let b = browse(v);
+        let names = b.ticked.iter().map(|&i| b.tree.name(i).to_string_lossy());
+        let mut names: Vec<String> = names.map(|n| n.into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// Ticks the item at `path` (Space on its row).
+    fn tick(v: &mut View, path: &Path) {
+        let id = browse(v).tree.find(path).unwrap();
+        browse(v).select(id);
+        key(v, KeyCode::Char(' '));
+    }
+
+    /// Arms the open dialog and moves the focus to Move to Trash, as time would, without
+    /// drawing it.
+    fn arm(v: &mut View) {
+        let c = browse(v).confirm.as_mut().unwrap();
+        c.opened -= Duration::from_secs(1);
+        c.shown_armed = true;
+        key(v, KeyCode::Tab);
+        browse(v).confirm.as_mut().unwrap().focused -= Duration::from_secs(1);
     }
 
     fn hover(v: &mut View, x: u16, y: u16) -> Outcome {
@@ -1557,7 +2475,9 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert!(browse(&mut v).cursor < cursor);
-        // Every cell of the selected tile's outline selects that tile, in every class mode.
+        // Every cell of the selected tile's outline selects that tile, in every class mode. A
+        // file big enough for a tile of its own beside it (small and linked share the rest).
+        fs::write(cache.join("wide"), vec![0u8; 200_000]).unwrap();
         for t in [false, true] {
             let mut v = ready(policy(&home, None), &cache);
             v.by_age = t;
@@ -1574,15 +2494,13 @@ mod tests {
             // The frame's right edge is left of the gap column.
             assert_eq!(buf[(tile.right() - 2, tile.y)].symbol(), "╮", "the outline");
             // The other tiles are framed too.
-            let small = browse(&mut v).tree.find(&cache.join("small")).unwrap();
-            let other = v.hits.tiles.iter().find(|t| t.1 == Some(small)).unwrap().0;
-            if other.width >= 5 && other.height >= 4 {
-                assert_eq!(
-                    buf[(other.x, other.y)].symbol(),
-                    "╭",
-                    "every tile is framed"
-                );
-            }
+            let wide = browse(&mut v).tree.find(&cache.join("wide")).unwrap();
+            let other = v.hits.tiles.iter().find(|t| t.1 == Some(wide)).unwrap().0;
+            assert_eq!(
+                buf[(other.x, other.y)].symbol(),
+                "╭",
+                "every tile is framed"
+            );
             for (x, y) in (tile.x..tile.right())
                 .flat_map(|x| [(x, tile.y), (x, tile.bottom() - 1)])
                 .chain((tile.y..tile.bottom()).flat_map(|y| [(tile.x, y), (tile.right() - 1, y)]))
@@ -1601,6 +2519,8 @@ mod tests {
         let (_t, home) = home("view-classes");
         let cache = home.join(".cache");
         fs::write(cache.join("clip.MP4"), vec![0u8; 50_000]).unwrap();
+        // An "other" with a tile of its own (small and linked share the rest).
+        fs::write(cache.join("data.bin"), vec![0u8; 50_000]).unwrap();
         for (by_age, legend) in [
             (false, ["/ folder", "V video", "O other"]),
             (true, ["W this week"; 3]),
@@ -1627,6 +2547,148 @@ mod tests {
                     .map(|x| text_at(&lines, x, r.y))
                     .collect();
                 assert_eq!(label, format!("{want} "), "{name}");
+            }
+        }
+    }
+
+    /// The text in `r`'s cells, a line a row.
+    fn text_in(lines: &[String], r: Rect) -> Vec<String> {
+        (r.y..r.bottom())
+            .map(|y| (r.x..r.right()).map(|x| text_at(lines, x, y)).collect())
+            .collect()
+    }
+
+    /// A folder of one big file and 300 small ones ("s000" of 100 bytes to "s299" of 399), in
+    /// apparent sizes: most of the small ones share the rest.
+    fn many_small(tag: &str) -> (TempDir, View) {
+        let (t, home) = home(tag);
+        let many = home.join(".cache/many");
+        fs::create_dir(&many).unwrap();
+        fs::write(many.join("big"), vec![0u8; 700_000]).unwrap();
+        for i in 0..300 {
+            fs::write(many.join(format!("s{i:03}")), vec![0u8; 100 + i]).unwrap();
+        }
+        let mut v = ready(policy(&home, None), &many);
+        key(&mut v, KeyCode::Char('a')); // apparent sizes: the lengths, whatever the disk does
+        v.panes = Panes::Map;
+        (t, v)
+    }
+
+    #[test]
+    fn the_rest_lists_what_it_holds_largest_first_and_how_many_more() {
+        let (_t, mut v) = many_small("view-rest-list");
+        // Where the map gives the rest room for lines (it may also end a strip, narrow).
+        let roomy = [(60, 30), (80, 30), (100, 40), (120, 40)]
+            .into_iter()
+            .find(|&(w, h)| {
+                text(&mut v, w, h);
+                let rest = v.hits.tiles.iter().find(|t| t.1.is_none()).unwrap().0;
+                rest.width >= 30 && rest.height >= 6
+            });
+        let (w, h) = roomy.expect("a rest wide and high enough for lines at one size at least");
+        let lines = text(&mut v, w, h);
+        let rest = v.hits.tiles.iter().find(|t| t.1.is_none()).unwrap().0;
+        // On its top edge the label, whole; inside its frame (in a cell from each edge, the gap
+        // column and the gutter row outside it) a line for each item, whole, the last saying
+        // how many more.
+        let own = v.hits.tiles.iter().filter(|t| t.1.is_some()).count();
+        let count = 301 - own;
+        let top = text_in(&lines, Rect::new(rest.x + 1, rest.y, rest.width - 3, 1));
+        assert!(top[0].starts_with(&format!("+{count} items")), "{top:?}");
+        let inside = Rect::new(rest.x + 1, rest.y + 1, rest.width - 3, rest.height - 3);
+        let inside: Vec<String> = text_in(&lines, inside)
+            .iter()
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        let (more, listed) = inside.split_last().unwrap();
+        assert!(listed.len() >= 3, "{inside:#?}");
+        // Largest first: s299 is the largest of them, so each line's number is lower.
+        let numbers: Vec<u32> = listed.iter().map(|l| l[1..4].parse().unwrap()).collect();
+        assert!(numbers.windows(2).all(|w| w[0] > w[1]), "{inside:#?}");
+        for (line, n) in listed.iter().zip(&numbers) {
+            let size = format!("{} bytes", 100 + n);
+            assert!(line.contains(&size) && line.ends_with("<1%"), "{inside:#?}");
+        }
+        assert_eq!(*more, format!("+{} more", count - listed.len()));
+    }
+
+    #[test]
+    fn the_rest_shows_its_count_whole_however_narrow() {
+        let (_t, mut v) = many_small("view-rest-narrow");
+        for (w, h) in [(24, 12), (30, 16), (40, 12), (60, 30), (80, 24)] {
+            for chosen in [false, true] {
+                if chosen {
+                    select(&mut v, "s000"); // the smallest: in the rest
+                }
+                let lines = text(&mut v, w, h);
+                let rest = v.hits.tiles.iter().find(|t| t.1.is_none()).unwrap().0;
+                let own = v.hits.tiles.iter().filter(|t| t.1.is_some()).count();
+                let cells = text_in(&lines, rest);
+                let count = format!("+{}", 301 - own);
+                assert!(
+                    cells.iter().any(|l| l.contains(&count)),
+                    "{w}x{h}, chosen {chosen}: {cells:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_tile_and_no_line_of_the_rest_is_cut() {
+        // Whole or not at all: no cut mark inside any tile, in either icon set.
+        let (_t, home) = home("view-never-cut");
+        let (_m, many) = many_small("view-never-cut-many");
+        let mut views = vec![
+            ready(policy(&home, None), &home),
+            ready(policy(&home, None), &home.join(".cache")),
+            many,
+        ];
+        for v in &mut views {
+            for set in [IconSet::Unicode, IconSet::Ascii] {
+                v.set_icons(set);
+                let cut = set.glyphs().cut;
+                for panes in [Panes::Both, Panes::Map] {
+                    v.panes = panes;
+                    for (w, h) in [(120, 40), (120, 34), (80, 24), (60, 30), (40, 12)] {
+                        let lines = text(v, w, h);
+                        for (r, _) in v.hits.tiles.clone() {
+                            let cells = text_in(&lines, r).concat();
+                            assert!(!cells.contains(cut), "{set:?} {w}x{h} {r:?}: {cells}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn under_each_tile_the_gutter_is_half_a_row_in_its_colour() {
+        use crate::style::{Colors, Depth};
+        let (_t, home) = home("view-gutter");
+        for (set, depth) in [
+            (IconSet::Unicode, Depth::True),
+            (IconSet::Unicode, Depth::C16),
+            (IconSet::Ascii, Depth::True),
+        ] {
+            let mut v = ready(policy(&home, None), &home.join(".cache/big/inner"));
+            v.set_icons(set);
+            v.set_colors(Colors::default().fitted(depth));
+            let buf = draw_buf(&mut v, 120, 40);
+            let pane = v.colors.bg;
+            let tiles = v.hits.tiles.clone();
+            assert_eq!(tiles.len(), 20, "inner's twenty files");
+            for (r, _) in tiles {
+                // The tile's colour, on its size line; the gutter is the tile's last row.
+                let colour = buf[(r.x + 1, r.y + 1)].bg;
+                let gutter = &buf[(r.x + 1, r.bottom() - 1)];
+                let seen = (gutter.symbol(), gutter.fg, gutter.bg);
+                match set {
+                    IconSet::Ascii => assert_eq!((seen.0, seen.2), (" ", pane), "{r:?}"),
+                    _ => assert_eq!(seen, ("▀", colour, pane), "{set:?} {depth:?} {r:?}"),
+                }
+                assert_ne!(colour, pane, "{r:?}");
+                // The gap column at the right is the pane's, all the way down.
+                assert_eq!(buf[(r.right() - 1, r.bottom() - 1)].bg, pane, "{r:?}");
             }
         }
     }
@@ -1676,6 +2738,9 @@ mod tests {
             msg,
             "Moved to the trash: small, 4.1 kB - freed when the trash is emptied"
         );
+        // The folder is scanned again, the message staying through it; then nothing waits.
+        settle(&mut v);
+        assert_eq!(v.message, Some(msg));
         assert_eq!(v.next_wake(), None, "no timer");
         let lines = text(&mut v, 120, 40);
         assert!(
@@ -1705,6 +2770,8 @@ mod tests {
         browse(&mut v).confirm.as_mut().unwrap().focused -= REFOCUS;
         key(&mut v, KeyCode::Enter);
         assert!(v.done);
+        settle(&mut v);
+        assert!(v.done, "through the scan again");
         select(&mut v, ".config");
         key(&mut v, KeyCode::Delete);
         assert!(!v.done && v.message.as_ref().unwrap().contains("protected"));
@@ -1942,21 +3009,20 @@ mod tests {
             .all(|r| (r.1 == 0) == (r.0 == b.zoom) && r.1 <= 1));
         assert!(row_shown(&mut v, ".cache") && !row_shown(&mut v, "big"));
         let lines = text(&mut v, 120, 40);
-        assert!(has(&lines, "▸ .cache/") && !has(&lines, "big/"));
+        assert!(has(&lines, "▸ ☐ .cache/") && !has(&lines, "big/"));
     }
 
     #[test]
     fn tree_and_map_select_each_other_and_a_double_click_opens_and_closes() {
         let (_t, home) = home("view-mouse");
+        // A file with a tile of its own beside big's (small and linked share the rest).
+        fs::write(home.join(".cache/wide"), vec![0u8; 200_000]).unwrap();
         let mut v = ready(policy(&home, None), &home.join(".cache"));
         text(&mut v, 120, 40);
-        let small = browse(&mut v)
-            .tree
-            .find(&home.join(".cache/small"))
-            .unwrap();
-        let tile = v.hits.tiles.iter().find(|t| t.1 == Some(small)).unwrap().0;
+        let wide = browse(&mut v).tree.find(&home.join(".cache/wide")).unwrap();
+        let tile = v.hits.tiles.iter().find(|t| t.1 == Some(wide)).unwrap().0;
         click(&mut v, tile.x, tile.y);
-        assert_eq!(selected_name(&mut v), "small", "a tile selects its row");
+        assert_eq!(selected_name(&mut v), "wide", "a tile selects its row");
         select(&mut v, "big");
         let b = browse(&mut v);
         let big = b.rows[b.cursor].0;
@@ -1967,7 +3033,7 @@ mod tests {
         click(&mut v, x, y);
         assert_eq!(browse(&mut v).zoom, 0, "the shown folder stays");
         assert!(browse(&mut v).open.contains(&big) && row_shown(&mut v, "inner"));
-        assert!(has(&text(&mut v, 120, 40), "▾ big/"));
+        assert!(has(&text(&mut v, 120, 40), "▾ ☐ big/"));
         assert_eq!(selected_name(&mut v), "big");
         assert_eq!(
             browse(&mut v).map_of(),
@@ -2211,11 +3277,23 @@ mod tests {
         let mut v = ready(policy(&home, None), &mixed);
         key(&mut v, KeyCode::Char('a')); // apparent sizes: the lengths, whatever the disk does
         v.panes = Panes::Map;
-        // 40x12: a and b get tiles, the twenty small files one "+20 items" tile.
-        for (name, blue) in [("b", "b"), ("s7", "+"), ("a", "a"), ("s0", "+")] {
-            select(&mut v, name);
-            let (all, lit) = tiles(&mut v, 40, 12);
-            assert_eq!(all, ["a", "b", "+"]);
+        // 40x12: a and b get tiles, a few small files too, the others one "+N items" tile. Which
+        // of the twenty (all of one size) come first is the folder's order: ask the map.
+        let (all, _) = tiles(&mut v, 40, 12);
+        assert!(all.starts_with(&["a".into(), "b".into()]), "{all:?}");
+        assert_eq!(all.last().map(String::as_str), Some("+"), "{all:?}");
+        let small_tile = all.iter().find(|n| n.starts_with('s')).cloned();
+        let in_rest = (0..20)
+            .map(|i| format!("s{i}"))
+            .find(|n| !all.contains(n))
+            .unwrap();
+        let mut picks = vec![("b".to_string(), "b".to_string()), ("a".into(), "a".into())];
+        picks.push((in_rest, "+".into()));
+        picks.extend(small_tile.map(|n| (n.clone(), n)));
+        for (name, blue) in picks {
+            select(&mut v, &name);
+            let (now, lit) = tiles(&mut v, 40, 12);
+            assert_eq!(now, all);
             assert_eq!(lit, [blue], "{name}");
         }
     }
@@ -2342,11 +3420,13 @@ mod tests {
         for d in ["d_big", "D_small"] {
             fs::create_dir_all(dir.join(d)).unwrap();
         }
-        fs::write(dir.join("d_big/x"), vec![0u8; 50_000]).unwrap();
-        fs::write(dir.join("D_small/x"), vec![0u8; 500]).unwrap();
-        fs::write(dir.join("D_small/y"), vec![0u8; 500]).unwrap();
-        fs::write(dir.join("f_big"), vec![0u8; 80_000]).unwrap();
-        fs::write(dir.join("F_small"), vec![0u8; 2000]).unwrap();
+        // Big enough that each has room for a tile of its own on any filesystem (a folder's own
+        // blocks, none on tmpfs and 4 kB on ext4, change nothing here).
+        fs::write(dir.join("d_big/x"), vec![0u8; 500_000]).unwrap();
+        fs::write(dir.join("D_small/x"), vec![0u8; 100_000]).unwrap();
+        fs::write(dir.join("D_small/y"), vec![0u8; 100_000]).unwrap();
+        fs::write(dir.join("f_big"), vec![0u8; 800_000]).unwrap();
+        fs::write(dir.join("F_small"), vec![0u8; 150_000]).unwrap();
         let times = [
             ("d_big", 1_000),
             ("D_small", 2_000),
@@ -2421,14 +3501,12 @@ mod tests {
                     assert_eq!(cell.fg, c.depth[usize::from(level) % 3], "{at}");
                     assert_eq!(buf[(x + 2 * level + 1, y)].symbol(), " ", "{at}");
                 }
-                // A folder's chevron in its own level's colour; a file's icon as before.
+                // A folder's chevron in its own level's colour; a tick box (not ticked) dim.
                 let (at, fg) = match name {
-                    "leaf" => (x + 2 * depth + 2, c.icon_fg),
+                    "leaf" => (x + 2 * depth + 2, c.dim),
                     _ => (x + 2 * depth, c.depth[usize::from(depth) % 3]),
                 };
-                if set == IconSet::Unicode || name != "leaf" {
-                    assert_eq!(buf[(at, y)].fg, fg, "{set:?} {name}");
-                }
+                assert_eq!(buf[(at, y)].fg, fg, "{set:?} {name}");
             }
             // The selected row keeps its colours, guides and all.
             browse(&mut v).select(leaf);
@@ -2464,34 +3542,249 @@ mod tests {
     }
 
     #[test]
-    fn an_open_folder_stays_open_after_a_trash_inside_it_and_closes_on_rescan() {
-        let (_t, home) = home("view-open-trash");
-        let mut v = ready(policy(&home, None), &home.join(".cache"));
-        let inner = browse(&mut v)
-            .tree
-            .find(&home.join(".cache/big/inner"))
-            .unwrap();
-        browse(&mut v).select(inner);
+    fn a_trash_scans_again_and_shows_the_tree_as_it_was() {
+        let (_t, home) = home("view-refresh");
+        let cache = home.join(".cache");
+        for i in 0..30 {
+            fs::write(cache.join(format!("pad{i:02}")), vec![0u8; 100]).unwrap();
+        }
+        let mut v = ready(policy(&home, None), &home);
+        select(&mut v, ".cache");
+        key(&mut v, KeyCode::Enter); // shows .cache
+        let f3 = cache.join("big/inner/f3");
+        let id = browse(&mut v).tree.find(&f3).unwrap();
+        browse(&mut v).select(id); // opens big and inner
+        text(&mut v, 120, 12);
+        assert!(browse(&mut v).top > 0, "a short pane, scrolled");
         key(&mut v, KeyCode::Delete);
         age(&mut v);
         key(&mut v, KeyCode::Tab);
         browse(&mut v).confirm.as_mut().unwrap().focused -= REFOCUS;
         key(&mut v, KeyCode::Enter);
-        assert!(!home.join(".cache/big/inner").exists());
-        assert!(has(&text(&mut v, 120, 40), "▾ big/"), "still open");
-        assert!(!row_shown(&mut v, "inner"));
+        assert!(!f3.exists());
+        assert!(matches!(v.screen, Screen::Refreshing(..)), "scanning again");
+        // Meanwhile the scan's card and the message; the last tree is gone, what it showed (as
+        // the trash left it) kept by path.
+        let lines = text(&mut v, 120, 12);
+        assert!(has(&lines, "Moved to the trash: f3"), "{lines:#?}");
+        assert!(has(&lines, "Scanning"), "{lines:#?}");
+        let s = saved(&v);
+        let (next, line) = (home.join(&s.selected), s.line);
+        assert!(
+            next.starts_with(cache.join("big/inner")) && next != f3,
+            "{next:?}"
+        );
+        settle(&mut v);
         let b = browse(&mut v);
-        assert!(b.tree.node(b.rows[b.cursor].0).flags & TRASHED == 0);
-        // A rescan builds a new tree: folders start closed again.
+        assert!(b.tree.find(&f3).is_none(), "a new tree, from the disk");
+        assert_eq!(b.tree.path(b.zoom), cache, "the same folder shown");
+        let open: Vec<PathBuf> = b.open.iter().map(|&i| b.tree.path(i)).collect();
+        for p in [cache.join("big"), cache.join("big/inner")] {
+            assert!(open.contains(&p), "{} still open: {open:?}", p.display());
+        }
+        assert_eq!(
+            b.tree.path(b.rows[b.cursor].0),
+            next,
+            "the same row selected"
+        );
+        text(&mut v, 120, 12);
+        let b = browse(&mut v);
+        assert_eq!(b.cursor - b.top, line, "on the same line");
+    }
+
+    #[test]
+    fn r_scans_again_keeping_the_view_and_esc_stops_it_to_the_places() {
+        let (_t, home) = home("view-rescan");
+        let cache = home.join(".cache");
+        let new = cache.join("big/inner/new");
+        let inner_open = |v: &mut View| {
+            let inner = browse(v).tree.find(&cache.join("big/inner")).unwrap();
+            browse(v).select(inner);
+            key(v, KeyCode::Right);
+            assert_eq!(selected_name(v), "inner");
+        };
+        let mut v = ready(policy(&home, None), &cache);
+        inner_open(&mut v);
         key(&mut v, KeyCode::Char('r'));
+        assert!(matches!(v.screen, Screen::Refreshing(..)));
+        assert_eq!(v.next_wake(), Some(SCAN_CHECK));
+        assert!(has(&text(&mut v, 120, 40), "scanning again"));
+        // Esc stops it. The last tree went when the scan started: the places, as after a first
+        // scan stopped.
+        key(&mut v, KeyCode::Esc);
         for _ in 0..5000 {
             v.tick();
-            if matches!(v.screen, Screen::Browse(_)) {
+            if !matches!(v.screen, Screen::Refreshing(..)) {
                 break;
             }
             sleep(Duration::from_millis(1));
         }
-        assert_eq!(browse(&mut v).open, HashSet::from([0]));
+        assert!(matches!(v.screen, Screen::Start(_)), "back to the places");
+        // To the end: a file made meanwhile is there, inner still open and selected.
+        let mut v = ready(policy(&home, None), &cache);
+        inner_open(&mut v);
+        fs::write(&new, b"x").unwrap();
+        key(&mut v, KeyCode::Char('r'));
+        settle(&mut v);
+        assert!(browse(&mut v).tree.find(&new).is_some());
+        assert!(
+            row_shown(&mut v, "new") && row_shown(&mut v, "f0"),
+            "inner open"
+        );
+        assert_eq!(selected_name(&mut v), "inner");
+    }
+
+    #[test]
+    fn while_scanning_again_keys_and_clicks_wait_and_the_message_stays() {
+        let (_t, home) = home("view-refresh-keys");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        text(&mut v, 120, 40);
+        let cursor = browse(&mut v).cursor;
+        key(&mut v, KeyCode::Char('r'));
+        v.message = Some("kept".into());
+        for code in [
+            KeyCode::Down,
+            KeyCode::Delete,
+            KeyCode::Enter,
+            KeyCode::Char('r'),
+        ] {
+            assert_eq!(key(&mut v, code), Outcome::None, "{code:?}");
+        }
+        let rows = v.hits.rows;
+        assert_eq!(click(&mut v, rows.x + 2, rows.y + 1), Outcome::None);
+        assert!(matches!(v.screen, Screen::Refreshing(..)));
+        assert_eq!(v.message.as_deref(), Some("kept"));
+        assert!(has(&text(&mut v, 120, 40), "kept"));
+        assert_eq!(key(&mut v, KeyCode::Char('q')), Outcome::Quit);
+        // None of them did anything: the same row selected, no dialog, once the tree is back.
+        settle(&mut v);
+        let b = browse(&mut v);
+        assert!(b.cursor == cursor && b.confirm.is_none());
+        assert_eq!(v.message.as_deref(), Some("kept"));
+    }
+
+    #[test]
+    fn a_folder_gone_keeps_its_last_tree_and_says_so() {
+        let (_t, home) = home("view-refresh-gone");
+        let big = home.join(".cache/big");
+        let mut v = ready(policy(&home, None), &big);
+        fs::rename(&big, home.join(".cache/moved")).unwrap();
+        key(&mut v, KeyCode::Char('r'));
+        assert!(matches!(v.screen, Screen::Browse(_)), "the last tree stays");
+        let msg = v.message.clone().unwrap();
+        assert!(msg.starts_with("Cannot scan"), "{msg}");
+        // After a trash, the message keeps what the trash did, and its check mark.
+        v.message = Some("Moved to the trash: x".into());
+        v.done = true;
+        v.refresh();
+        let msg = v.message.clone().unwrap();
+        assert!(
+            msg.starts_with("Moved to the trash: x; cannot scan "),
+            "{msg}"
+        );
+        assert!(v.done);
+    }
+
+    #[test]
+    fn a_scan_again_through_a_new_symlink_ends_and_keeps_the_view() {
+        let (_t, home) = home("view-refresh-link");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &cache.join("big"));
+        select(&mut v, "inner");
+        key(&mut v, KeyCode::Right);
+        let f0 = browse(&mut v)
+            .tree
+            .find(&cache.join("big/inner/f0"))
+            .unwrap();
+        browse(&mut v).ticked.insert(f0);
+        // The folder moves and a symlink takes its place: the scan again starts from the old
+        // path, and its tree's root is the new one.
+        fs::rename(cache.join("big"), cache.join("moved")).unwrap();
+        std::os::unix::fs::symlink(cache.join("moved"), cache.join("big")).unwrap();
+        key(&mut v, KeyCode::Char('r'));
+        // On a thread of its own, so a tick that never ends fails the test instead of hanging.
+        let ticks = std::thread::spawn(move || {
+            settle(&mut v);
+            v
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !ticks.is_finished() {
+            assert!(Instant::now() < deadline, "the scan again never ended");
+            sleep(Duration::from_millis(5));
+        }
+        let mut v = ticks.join().unwrap();
+        let moved = fs::canonicalize(cache.join("moved")).unwrap();
+        assert_eq!(browse(&mut v).tree.root_path(), moved);
+        assert_eq!(selected_name(&mut v), "inner");
+        assert!(row_shown(&mut v, "f0"), "inner still open");
+        // Ticks pick what Del moves: under a folder swapped for another, none stay.
+        assert!(browse(&mut v).ticked.is_empty());
+    }
+
+    #[test]
+    fn a_shown_folder_that_became_a_file_gives_way_to_the_folder_holding_it() {
+        let (_t, home) = home("view-refresh-zoom-file");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &cache);
+        select(&mut v, "big");
+        key(&mut v, KeyCode::Enter);
+        select(&mut v, "inner");
+        key(&mut v, KeyCode::Enter); // inner shown
+        fs::rename(cache.join("big/inner"), home.join("inner-away")).unwrap();
+        fs::write(cache.join("big/inner"), b"a file now").unwrap();
+        key(&mut v, KeyCode::Char('r'));
+        settle(&mut v);
+        let b = browse(&mut v);
+        assert_eq!(
+            b.tree.path(b.zoom),
+            cache.join("big"),
+            "not the scanned folder"
+        );
+        assert_eq!(selected_name(&mut v), "inner");
+    }
+
+    #[test]
+    fn a_folder_that_became_a_file_is_not_kept_open() {
+        let (_t, home) = home("view-refresh-file");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &cache);
+        select(&mut v, "big");
+        key(&mut v, KeyCode::Right);
+        fs::rename(cache.join("big"), home.join("big-away")).unwrap();
+        fs::write(cache.join("big"), b"a file now").unwrap();
+        key(&mut v, KeyCode::Char('r'));
+        settle(&mut v);
+        let b = browse(&mut v);
+        assert!(
+            b.open.iter().all(|&i| b.tree.node(i).is_dir()),
+            "{:?}",
+            b.open
+        );
+        assert_eq!(selected_name(&mut v), "big");
+    }
+
+    #[test]
+    fn a_click_before_the_new_tree_is_drawn_finds_no_tile_of_the_last_one() {
+        let (_t, home) = home("view-refresh-hits");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &cache);
+        select(&mut v, "big");
+        key(&mut v, KeyCode::Enter);
+        select(&mut v, "inner");
+        key(&mut v, KeyCode::Enter); // the map: inner's twenty files
+        text(&mut v, 120, 40);
+        let tile = v.hits.tiles.iter().find(|t| t.1.is_some()).unwrap().0;
+        // The new tree has none of them, nor that many entries.
+        fs::rename(cache.join("big"), home.join("big-away")).unwrap();
+        key(&mut v, KeyCode::Char('r'));
+        settle(&mut v); // and no drawing after it
+        assert!(v.hits.tiles.is_empty() && v.hits.locks.is_empty());
+        let b = browse(&mut v);
+        let before = (b.cursor, b.zoom);
+        v.last_click = None;
+        assert_eq!(click(&mut v, tile.x + 1, tile.y), Outcome::None);
+        let b = browse(&mut v);
+        assert_eq!((b.cursor, b.zoom), before);
     }
 
     #[test]
@@ -2534,7 +3827,1089 @@ mod tests {
         );
     }
 
-    /// Prints the start screen, the tree and the dialog at 120x40, in Unicode and in ASCII,
+    #[test]
+    fn every_tile_writes_its_text_in_bold() {
+        use ratatui::style::Modifier;
+        let (_t, home) = home("view-tile-bold");
+        let mixed = home.join(".cache/mixed");
+        fs::create_dir(&mixed).unwrap();
+        fs::write(mixed.join("a"), vec![0u8; 120_000]).unwrap();
+        fs::write(mixed.join("b"), vec![0u8; 100_000]).unwrap();
+        for i in 0..20 {
+            fs::write(mixed.join(format!("s{i}")), vec![0u8; 3000]).unwrap();
+        }
+        let (mut others, mut rest) = (0, 0);
+        // inner: twenty tiles of their own; mixed at 40x12: a, b and a "+20 items" tile.
+        for (dir, w, h) in [(home.join(".cache/big/inner"), 120, 40), (mixed, 40, 12)] {
+            let mut v = ready(policy(&home, None), &dir);
+            key(&mut v, KeyCode::Char('a')); // apparent sizes: the lengths, whatever the disk does
+            v.panes = Panes::Map;
+            let buf = draw_buf(&mut v, w, h);
+            let b = browse(&mut v);
+            let selected = b.rows[b.cursor].0;
+            for (r, id) in v.hits.tiles.clone() {
+                if r.width < 3 {
+                    continue;
+                }
+                let bold = |x: u16, y: u16| buf[(x, y)].modifier.contains(Modifier::BOLD);
+                assert!(
+                    bold(r.x + 1, r.y),
+                    "{id:?}: the class letter and name, or +N items"
+                );
+                // The "+N items" tile has no size line.
+                if r.height >= 2 && id.is_some() {
+                    assert!(bold(r.x + 1, r.y + 1), "{id:?}: the size");
+                }
+                others += usize::from(id != Some(selected));
+                rest += usize::from(id.is_none());
+            }
+        }
+        assert!(others > 0, "tiles besides the selected one");
+        assert_eq!(rest, 1, "the small items' tile");
+    }
+
+    #[test]
+    fn the_columns_stay_in_the_pane_at_every_width_with_a_long_wide_name() {
+        let (_t, home) = home("view-wide-name");
+        let cache = home.join(".cache");
+        let name = "很長的中文檔案名稱用來看欄寬在每個寬度是否都正確.txt";
+        fs::write(cache.join(name), vec![0u8; 5000]).unwrap();
+        let mut v = ready(policy(&home, None), &cache);
+        for panes in [Panes::Both, Panes::Tree] {
+            v.panes = panes;
+            for w in 24..=140 {
+                let buf = draw_buf(&mut v, w, 12);
+                let (heads, pane) = (v.hits.heads.clone(), v.hits.rows);
+                for (i, (at, field)) in heads.iter().enumerate() {
+                    let here = format!("{panes:?} at {w}: {at:?} in {pane:?}");
+                    assert!(at.x >= pane.x && at.right() <= pane.right(), "{here}");
+                    // The heading drawn in its own cells: its title, then the sort arrow.
+                    let drawn: String = (at.x..at.right())
+                        .map(|x| buf[(x, at.y)].symbol())
+                        .collect();
+                    let title = drawn.trim().trim_end_matches(['▴', '▾']);
+                    let want: &[&str] = match field {
+                        Field::Name => &["Name"],
+                        Field::Size => &["Usage", "Size"],
+                        Field::Items => &["Items"],
+                        Field::Modified => &["Modified"],
+                    };
+                    assert!(want.contains(&title), "{here}: {drawn:?}");
+                    // The rows' column lines are under the headings' ones.
+                    if i > 0 {
+                        assert_eq!(buf[(at.x - 1, pane.y)].symbol(), "│", "{here}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_title_ends_with_the_version_and_the_path_gives_way_first() {
+        let (_t, home) = home("view-version");
+        let version = format!("termdisk v{}", env!("CARGO_PKG_VERSION"));
+        let cache = home.join(".cache");
+        let mut views = [
+            View::new(policy(&home, None), None),
+            View::new(policy(&home, None), Some(&cache)),
+            ready(policy(&home, None), &cache),
+        ];
+        for v in &mut views {
+            for w in 24..=140 {
+                let top: Vec<char> = text(v, w, 12)[0].chars().collect();
+                let line: String = top.iter().collect();
+                // Whole wherever the title's room (8 cells less than the bar) holds it; else
+                // cut at its end only.
+                let room = w as usize - 8;
+                let shown = match version.len() <= room {
+                    true => version.clone(),
+                    false => format!("{}…", &version[..room - 1]),
+                };
+                assert!(line.contains(&shown), "{w}: {line:?}");
+                assert_eq!(top[w as usize - 4], ' ', "{w}: clear of the close button");
+            }
+        }
+        // The tree's title: the whole path where there is room; narrower, the path is cut in
+        // its middle while the size stays; the version stays at every width.
+        let tree = &mut views[2];
+        let path = cache.display().to_string();
+        let top = text(tree, 140, 12).swap_remove(0);
+        assert!(
+            top.contains(&path) && top.contains("(disk usage)"),
+            "{top:?}"
+        );
+        let cut_path_kept_size = (24..140).any(|w| {
+            let top = text(tree, w, 12).swap_remove(0);
+            top.contains('…') && top.contains("(disk usage)")
+        });
+        assert!(cut_path_kept_size, "the path gives way before the size");
+    }
+
+    #[test]
+    fn names_take_the_cells_the_columns_do_not_need() {
+        let (_t, home) = home("view-name-room");
+        let cache = home.join(".cache");
+        fs::write(cache.join("IMG_4102_holiday.jpeg"), vec![0u8; 5000]).unwrap();
+        let mut v = ready(policy(&home, None), &cache);
+        let lines = text(&mut v, 120, 40);
+        assert!(has(&lines, "IMG_4102_holiday.jpeg"), "{lines:#?}");
+        // Usage's bar gave cells to the name, and still shows.
+        assert!(has(&lines, "100% ━") && !has(&lines, "100% ━━━━━━━━"));
+        // Where the names fit, the bar keeps its 8 cells.
+        let mut v = ready(policy(&home, None), &cache.join("big/inner"));
+        assert!(has(&text(&mut v, 120, 40), "100% ━━━━━━━━"));
+    }
+
+    #[test]
+    fn a_folder_that_only_holds_a_locked_item_has_no_lock_and_del_says_why() {
+        let (_t, home) = home("view-holds");
+        fs::create_dir_all(home.join(".cargo/registry")).unwrap();
+        fs::write(home.join(".cargo/registry/crate"), vec![0u8; 5000]).unwrap();
+        fs::write(home.join(".cargo/credentials.toml"), b"token").unwrap();
+        let mut v = ready(policy(&home, None), &home);
+        let lines = text(&mut v, 120, 40);
+        assert!(
+            has(&lines, ".cargo/") && !has(&lines, ".cargo/ ⊘"),
+            "{lines:#?}"
+        );
+        assert!(has(&lines, ".config/ ⊘"), "protected itself: still locked");
+        select(&mut v, ".cargo");
+        key(&mut v, KeyCode::Delete);
+        assert!(
+            browse(&mut v).confirm.is_none(),
+            "the guard still refuses it"
+        );
+        let msg = v.message.clone().unwrap();
+        let want = "Cannot move to the trash: it holds 1 locked item; protected: ";
+        assert!(msg.starts_with(want), "{msg}");
+        assert!(msg.ends_with("/.cargo/credentials.toml"), "{msg}");
+        assert!(home.join(".cargo/credentials.toml").exists());
+        // Inside it, the locked item itself has the lock.
+        key(&mut v, KeyCode::Right);
+        assert!(has(&text(&mut v, 120, 40), "credentials.toml ⊘"));
+    }
+
+    /// The line and column where `s` starts in `lines`, in cells.
+    fn find_text(lines: &[String], s: &str) -> Option<(usize, usize)> {
+        lines.iter().enumerate().find_map(|(y, l)| {
+            let i = l.find(s)?;
+            Some((y, l[..i].chars().count()))
+        })
+    }
+
+    #[test]
+    fn a_lock_under_the_pointer_says_why_and_a_click_there_selects_its_row() {
+        let (_t, home) = home("view-tip");
+        fs::write(home.join(".config/app/big"), vec![0u8; 600_000]).unwrap();
+        let mut v = ready(policy(&home, None), &home);
+        select(&mut v, "Downloads");
+        text(&mut v, 120, 40);
+        let config = browse(&mut v).tree.find(&home.join(".config")).unwrap();
+        let rows = v.hits.rows;
+        let mine = |v: &View, in_tree: bool| {
+            let at = v
+                .hits
+                .locks
+                .iter()
+                .find(|l| l.1 == config && (l.0.x < rows.right()) == in_tree);
+            at.expect("a lock for .config").0
+        };
+        let lock = mine(&v, true);
+        let why = "protected: ~/.config, with everything in it";
+        // Onto the lock: drawn again, the reason in a framed box.
+        assert_eq!(hover(&mut v, lock.x + 1, lock.y), Outcome::Redraw);
+        assert_eq!(v.hover, Hover::Lock(config));
+        let lines = text(&mut v, 120, 40);
+        let (y, x) = find_text(&lines, why).expect("the reason");
+        assert_eq!(
+            lines[y].chars().nth(x - 2),
+            Some('│'),
+            "a frame: {:?}",
+            lines[y]
+        );
+        assert_eq!(
+            hover(&mut v, lock.x, lock.y),
+            Outcome::None,
+            "the space before it too"
+        );
+        let again = find_text(&text(&mut v, 120, 40), why);
+        assert_eq!(
+            again,
+            Some((y, x)),
+            "the box stays at the lock, wherever on it the pointer is"
+        );
+        // Along the row, off the lock: gone.
+        hover(&mut v, rows.x + 2, lock.y);
+        assert!(!has(&text(&mut v, 120, 40), why));
+        // A click on the lock is a click on its row.
+        hover(&mut v, lock.x + 1, lock.y);
+        click(&mut v, lock.x + 1, lock.y);
+        assert_eq!(selected_name(&mut v), ".config");
+        // The lock on its tile says the same.
+        text(&mut v, 120, 40);
+        let tile = mine(&v, false);
+        hover(&mut v, tile.x + 1, tile.y);
+        assert_eq!(v.hover, Hover::Lock(config));
+        assert!(has(&text(&mut v, 120, 40), why));
+    }
+
+    #[test]
+    fn the_reason_shows_in_a_frame_in_ascii_and_16_colours() {
+        use crate::style::{Colors, Depth};
+        let (_t, home) = home("view-tip-ascii");
+        let mut v = ready(policy(&home, None), &home);
+        v.set_icons(IconSet::Ascii);
+        v.set_colors(Colors::default().fitted(Depth::C16));
+        text(&mut v, 120, 40);
+        let config = browse(&mut v).tree.find(&home.join(".config")).unwrap();
+        let lock = v.hits.locks.iter().find(|l| l.1 == config).unwrap().0;
+        hover(&mut v, lock.x + 1, lock.y);
+        let lines = text(&mut v, 120, 40);
+        let (y, x) = find_text(&lines, "protected: ~/.config, with").expect("the reason");
+        let cell = |dy: usize, dx: usize| lines[y + dy - 1].chars().nth(x + dx - 2);
+        assert_eq!(
+            (cell(0, 0), cell(1, 0), cell(2, 0)),
+            (Some('+'), Some('|'), Some('+'))
+        );
+        // In 16 colours the box is as black as the pane: the frame is what shows it.
+        assert_eq!(v.colors.widget_bg, v.colors.side_bg);
+    }
+
+    #[test]
+    fn the_reason_names_every_lock_of_an_item() {
+        use crate::tree::{DIR, FILE, MOUNT, NOT_OWNED, UNREADABLE};
+        let (_t, home) = home("view-reasons");
+        let p = policy(&home, None);
+        let mut t = Tree::new(PathBuf::from("/nowhere/r"), 1);
+        t.push(0, b"", 0, 0, 1, 0, DIR);
+        t.add_children(0, 1, 3);
+        t.push(0, b"mnt", 0, 0, 2, 0, DIR | MOUNT);
+        t.push(0, b"odd", 0, 0, 3, 0, DIR | UNREADABLE | NOT_OWNED);
+        t.push(0, b"f", 0, 0, 4, 0, FILE);
+        t.finish();
+        assert_eq!(lock_reason(&t, 1, &p), "a mount point: /nowhere/r/mnt");
+        // From the scan's flags and the policy's paths alone: the view never waits on the disk
+        // to draw (/nowhere does not exist).
+        let odd = "not yours: another user owns it; could not be read";
+        assert_eq!(lock_reason(&t, 2, &p), odd);
+        // Protected: itself only, with everything in it, or inside such a path.
+        let mut v = ready(policy(&home, None), &home);
+        let Screen::Browse(b) = &mut v.screen else {
+            panic!("not browsing")
+        };
+        let why =
+            |rel: &str| lock_reason(&b.tree, b.tree.find(&home.join(rel)).unwrap(), &v.policy);
+        assert_eq!(
+            why("Downloads"),
+            "protected: ~/Downloads (what is in it may go)"
+        );
+        assert_eq!(
+            why(".config"),
+            "protected: ~/.config, with everything in it"
+        );
+        assert_eq!(why(".config/app/rc"), "protected: inside ~/.config");
+        // Not the user's, as the scan saw it.
+        let (data, config) = (home.join(".local/share"), home.join(".config"));
+        let homes = [home.clone()];
+        let other = Policy::new(me() + 1, None, &homes, &data, &config, None, None);
+        let mut v = ready(other, &home.join(".cache"));
+        let Screen::Browse(b) = &mut v.screen else {
+            panic!("not browsing")
+        };
+        let small = b.tree.find(&home.join(".cache/small")).unwrap();
+        let reason = lock_reason(&b.tree, small, &v.policy);
+        assert_eq!(reason, "not yours: another user owns it");
+    }
+
+    #[test]
+    fn space_ticks_and_moves_down_and_the_shown_folder_takes_no_tick() {
+        use crate::style::{Colors, Depth};
+        let (_t, home) = home("view-tick");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        key(&mut v, KeyCode::Home);
+        key(&mut v, KeyCode::Char(' '));
+        assert!(ticked(&mut v).is_empty(), "the shown folder takes no tick");
+        assert_eq!(selected_name(&mut v), "big", "the cursor moved down");
+        key(&mut v, KeyCode::Char(' '));
+        key(&mut v, KeyCode::Char(' '));
+        assert_eq!(ticked(&mut v), ["big", "linked"]);
+        assert_eq!(selected_name(&mut v), "small");
+        let buf = draw_buf(&mut v, 120, 40);
+        let lines = text(&mut v, 120, 40);
+        assert!(
+            has(&lines, "▸ ☑ big/") && has(&lines, "  ☑ linked") && has(&lines, "  ☐ small"),
+            "{lines:#?}"
+        );
+        let y = row_y(&mut v, "linked");
+        assert_eq!(
+            buf[(v.hits.rows.x + 3, y)].bg,
+            v.colors.tick_bg,
+            "a tint too"
+        );
+        let status = &lines[39];
+        assert!(status.starts_with(" 2 ticked, "), "{status}");
+        assert!(
+            status.contains("Del trash them") && status.contains("Esc clear"),
+            "{status}"
+        );
+        // Space again takes the tick off.
+        select(&mut v, "linked");
+        key(&mut v, KeyCode::Char(' '));
+        assert_eq!(ticked(&mut v), ["big"]);
+        // Without colours: the ASCII boxes.
+        v.set_icons(IconSet::Ascii);
+        v.set_colors(Colors::default().fitted(Depth::C16));
+        let lines = text(&mut v, 120, 40);
+        assert!(
+            has(&lines, "> [x] big/") && has(&lines, "  [ ] linked"),
+            "{lines:#?}"
+        );
+        // The keys list them.
+        key(&mut v, KeyCode::Char('?'));
+        assert!(has(&text(&mut v, 120, 40), "Space, box, drag"));
+    }
+
+    /// The tick box of the row named `name`, as last drawn, and its item.
+    fn box_of(v: &mut View, name: &str) -> (Rect, NodeId) {
+        let b = browse(v);
+        let id = b.rows.iter().map(|r| r.0).find(|&i| b.tree.name(i) == name);
+        let id = id.unwrap();
+        (v.hits.boxes.iter().find(|h| h.1 == id).unwrap().0, id)
+    }
+
+    #[test]
+    fn a_short_list_never_scrolls_its_top_rows_away() {
+        // A scan again with a new row above the selected one: the selected item keeps its line
+        // only while the list is longer than the pane.
+        let (_t, home) = home("view-short");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &cache);
+        select(&mut v, "big");
+        text(&mut v, 120, 40);
+        assert_eq!(browse(&mut v).top, 0);
+        fs::create_dir(cache.join("huge")).unwrap(); // a folder: folders come first
+        fs::write(cache.join("huge/f"), vec![9u8; 900_000]).unwrap();
+        key(&mut v, KeyCode::Char('r'));
+        settle(&mut v);
+        let lines = text(&mut v, 120, 40);
+        assert_eq!(selected_name(&mut v), "big");
+        assert_eq!(browse(&mut v).cursor, 2, "huge came above it");
+        assert_eq!(
+            browse(&mut v).top,
+            0,
+            "nothing hidden above, no empty lines below"
+        );
+        let first = &lines[usize::from(v.hits.rows.y)];
+        assert!(
+            first.starts_with(" ▾ /"),
+            "the scanned folder's row: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_tick_box_ticks_its_row_and_moves_the_cursor_there() {
+        use ratatui::style::Modifier;
+        let (_t, home) = home("view-box");
+        // Read-only too: only Del is off there.
+        let mut v = ready(
+            policy(&home, Some("read-only: test".into())),
+            &home.join(".cache"),
+        );
+        key(&mut v, KeyCode::Home);
+        let buf = draw_buf(&mut v, 120, 40);
+        // Every row has its box but the shown folder's.
+        let (rows, zoom) = (browse(&mut v).rows.len(), browse(&mut v).zoom);
+        assert_eq!(v.hits.boxes.len(), rows - 1);
+        assert!(!v.hits.boxes.iter().any(|h| h.1 == zoom));
+        let top: String = (0..40).map(|x| buf[(x, v.hits.rows.y)].symbol()).collect();
+        assert!(!top.contains('☐') && !top.contains('☑'), "{top}");
+        let (small, id) = box_of(&mut v, "small");
+        assert_eq!(buf[(small.x, small.y)].symbol(), "☐");
+        assert_eq!(buf[(small.x, small.y)].fg, v.colors.dim);
+        // The pointer on it underlines it.
+        mouse(&mut v, MouseEventKind::Moved, small.x, small.y);
+        assert_eq!(v.hover, Hover::Box(id));
+        let buf = draw_buf(&mut v, 120, 40);
+        assert!(buf[(small.x, small.y)]
+            .modifier
+            .contains(Modifier::UNDERLINED));
+        // A click ticks it and puts the cursor there.
+        click(&mut v, small.x, small.y);
+        assert_eq!(ticked(&mut v), ["small"]);
+        assert_eq!(selected_name(&mut v), "small");
+        select(&mut v, "linked"); // the row's own colours, not the selection's
+        let buf = draw_buf(&mut v, 120, 40);
+        assert_eq!(buf[(small.x, small.y)].symbol(), "☑");
+        assert_eq!(buf[(small.x, small.y)].fg, v.colors.tick_fg);
+        // Two quick clicks on a folder's box: ticked, unticked, and no double click (the
+        // folder neither opens nor closes).
+        let (big, _) = box_of(&mut v, "big");
+        let open = browse(&mut v).open.len();
+        click(&mut v, big.x, big.y);
+        assert_eq!(ticked(&mut v), ["big", "small"]);
+        click(&mut v, big.x, big.y);
+        assert_eq!(ticked(&mut v), ["small"]);
+        assert_eq!(browse(&mut v).open.len(), open);
+        assert_eq!(selected_name(&mut v), "big");
+    }
+
+    /// `.cache` with big and inner open (and a file `side` in big, beside inner), big ticked.
+    fn big_ticked(tag: &str) -> (TempDir, PathBuf, View) {
+        let (t, home) = home(tag);
+        let cache = home.join(".cache");
+        fs::write(cache.join("big/side"), vec![4u8; 5000]).unwrap();
+        let mut v = ready(policy(&home, None), &cache);
+        let f0 = browse(&mut v)
+            .tree
+            .find(&cache.join("big/inner/f0"))
+            .unwrap();
+        browse(&mut v).select(f0); // opens big and inner
+        select(&mut v, "big");
+        key(&mut v, KeyCode::Char(' '));
+        assert_eq!(ticked(&mut v), ["big"]);
+        (t, cache, v)
+    }
+
+    #[test]
+    fn a_ticked_folder_ticks_what_is_in_it_and_unticking_one_item_splits_it() {
+        let (_t, cache, mut v) = big_ticked("view-split");
+        let lines = text(&mut v, 120, 40);
+        for s in ["☑ big/", "☑ inner/", "☑ f3", "☑ side"] {
+            assert!(has(&lines, s), "{s}: {lines:#?}");
+        }
+        let f3 = browse(&mut v)
+            .tree
+            .find(&cache.join("big/inner/f3"))
+            .unwrap();
+        let b = browse(&mut v);
+        let (all, one) = (b.ticked_size(false), counted(b.tree.node(f3), false));
+        // Space on f3: big's tick goes, what was in it but f3 stays ticked, each on its own.
+        browse(&mut v).select(f3);
+        key(&mut v, KeyCode::Char(' '));
+        let names = ticked(&mut v);
+        let files = (0..20).filter(|&i| i != 3).map(|i| format!("f{i}"));
+        let mut want: Vec<String> = files.chain(["side".into()]).collect();
+        want.sort();
+        assert_eq!(names, want);
+        assert_eq!(browse(&mut v).ticked_size(false), all - one);
+        let lines = text(&mut v, 120, 40);
+        for s in ["◩ big/", "◩ inner/", "☐ f3", "☑ f4", "☑ side"] {
+            assert!(has(&lines, s), "{s}: {lines:#?}");
+        }
+        // The count is of what is ticked on its own, as Del lists it.
+        assert!(lines[39].starts_with(" 20 ticked, "), "{}", lines[39]);
+        // Del moves those, and f3 stays.
+        key(&mut v, KeyCode::Delete);
+        let c = browse(&mut v).confirm.as_ref().unwrap();
+        let mut paths: Vec<PathBuf> = c.items.iter().map(|i| i.1.clone()).collect();
+        paths.sort();
+        let mut expect: Vec<PathBuf> = want
+            .iter()
+            .map(|n| match n.as_str() {
+                "side" => cache.join("big/side"),
+                f => cache.join("big/inner").join(f),
+            })
+            .collect();
+        expect.sort();
+        assert_eq!(paths, expect);
+        text(&mut v, 120, 40); // every path shown
+        arm(&mut v);
+        key(&mut v, KeyCode::Enter);
+        settle(&mut v);
+        assert!(cache.join("big/inner/f3").exists());
+        assert!(!cache.join("big/inner/f4").exists() && !cache.join("big/side").exists());
+    }
+
+    #[test]
+    fn a_folder_holding_ticks_shows_it_and_a_click_on_that_box_ticks_the_folder() {
+        let (_t, home) = home("view-part");
+        let inner = home.join(".cache/big/inner");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        tick(&mut v, &inner.join("f0"));
+        let lines = text(&mut v, 120, 40);
+        for s in ["◩ big/", "◩ inner/", "☑ f0", "☐ f1"] {
+            assert!(has(&lines, s), "{s}: {lines:#?}");
+        }
+        // Every file in it ticked: still not the folder itself (Del would move more).
+        for i in 1..20 {
+            tick(&mut v, &inner.join(format!("f{i}")));
+        }
+        assert_eq!(ticked(&mut v).len(), 20);
+        assert!(has(&text(&mut v, 120, 40), "◩ inner/"));
+        // Ticked, it shows ticked, never partly; the ticks in it go with it.
+        tick(&mut v, &inner);
+        assert_eq!(ticked(&mut v), ["inner"]);
+        let lines = text(&mut v, 120, 40);
+        assert!(
+            has(&lines, "☑ inner/") && has(&lines, "◩ big/"),
+            "{lines:#?}"
+        );
+        // A click on big's box ticks big, and big alone.
+        let (big, _) = box_of(&mut v, "big");
+        click(&mut v, big.x, big.y);
+        assert_eq!(ticked(&mut v), ["big"]);
+        let lines = text(&mut v, 120, 40);
+        assert!(has(&lines, "☑ big/") && has(&lines, "☑ inner/") && !has(&lines, "◩"));
+        // ASCII: the same width.
+        v.set_icons(IconSet::Ascii);
+        tick(&mut v, &inner.join("f0")); // splits big
+        assert!(has(&text(&mut v, 120, 40), "[-] big/"));
+    }
+
+    #[test]
+    fn a_ticked_home_or_wholly_protected_folder_is_not_opened_up() {
+        let (_t, home) = home("view-tick-home");
+        let one = "Cannot move to the trash: the ticked item cannot go; protected: ";
+        // ~/.local: protected with all in it (the data home is in it).
+        let mut v = ready(policy(&home, None), &home);
+        tick(&mut v, &home.join(".local"));
+        key(&mut v, KeyCode::Delete);
+        assert!(browse(&mut v).confirm.is_none());
+        let msg = v.message.clone().unwrap();
+        assert!(msg.starts_with(one), "{msg}");
+        // The home itself, from the folder above it: never everything in it that may go.
+        let mut v = ready(policy(&home, None), home.parent().unwrap());
+        tick(&mut v, &home);
+        key(&mut v, KeyCode::Delete);
+        assert!(browse(&mut v).confirm.is_none());
+        let msg = v.message.clone().unwrap();
+        assert!(msg.starts_with(one), "{msg}");
+    }
+
+    #[test]
+    fn a_ticked_folder_holding_a_locked_item_moves_all_but_it() {
+        let (_t, home) = home("view-tick-lock");
+        let (big, inner) = (home.join(".cache/big"), home.join(".cache/big/inner"));
+        fs::create_dir_all(home.join(".config/termdisk")).unwrap();
+        let protect = "~/.cache/big/inner/f7\n";
+        fs::write(home.join(".config/termdisk/protect"), protect).unwrap();
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        tick(&mut v, &big);
+        key(&mut v, KeyCode::Delete);
+        let c = browse(&mut v).confirm.as_ref().unwrap();
+        // The locked item and the folders on its way are not moved; the rest is.
+        let refused: Vec<&PathBuf> = c.refused.iter().map(|r| &r.0).collect();
+        assert_eq!(refused, [&big, &inner, &inner.join("f7")]);
+        let files = (0..20)
+            .filter(|&i| i != 7)
+            .map(|i| inner.join(format!("f{i}")));
+        let mut want: Vec<PathBuf> = files.collect();
+        want.sort();
+        let items: Vec<PathBuf> = c.items.iter().map(|i| i.1.clone()).collect();
+        assert_eq!(items, want);
+    }
+
+    #[test]
+    fn a_drag_off_over_a_folder_holding_ticks_takes_those_off_too() {
+        let (_t, home) = home("view-drag-part");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &cache);
+        tick(&mut v, &cache.join("big/inner/f0")); // big and inner ◩
+        tick(&mut v, &cache.join("small"));
+        text(&mut v, 120, 40);
+        let (small, _) = box_of(&mut v, "small");
+        let (big, _) = box_of(&mut v, "big");
+        mouse(
+            &mut v,
+            MouseEventKind::Down(MouseButton::Left),
+            small.x,
+            small.y,
+        );
+        assert_eq!(ticked(&mut v), ["f0"]);
+        mouse(
+            &mut v,
+            MouseEventKind::Drag(MouseButton::Left),
+            small.x,
+            big.y,
+        );
+        assert!(ticked(&mut v).is_empty(), "big painted ☐, f0 with it");
+        assert!(!has(&text(&mut v, 120, 40), "◩"));
+    }
+
+    #[test]
+    fn a_drag_off_over_rows_in_a_ticked_folder_splits_its_tick() {
+        let (_t, cache, mut v) = big_ticked("view-drag-split");
+        text(&mut v, 120, 40);
+        // Rows: .cache, big, inner, inner's 20 files, side, linked, small.
+        let b = browse(&mut v);
+        let name = |i: usize| b.tree.name(b.rows[i].0).to_string_lossy().into_owned();
+        let (a, z) = (name(4), name(6));
+        let off: Vec<String> = (4..=6).map(name).collect();
+        let (first, _) = box_of(&mut v, &a);
+        let (last, _) = box_of(&mut v, &z);
+        mouse(
+            &mut v,
+            MouseEventKind::Down(MouseButton::Left),
+            first.x,
+            first.y,
+        );
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        mouse(&mut v, drag, first.x, last.y);
+        let names = ticked(&mut v);
+        assert_eq!(names.len(), 19 - 2 + 1, "{names:?}"); // inner's other 17, and side
+        assert!(off.iter().all(|n| !names.contains(n)), "{off:?} {names:?}");
+        assert!(names.contains(&"side".to_string()) && !names.contains(&"big".to_string()));
+        mouse(
+            &mut v,
+            MouseEventKind::Up(MouseButton::Left),
+            first.x,
+            last.y,
+        );
+        select(&mut v, "big");
+        key(&mut v, KeyCode::Char(' ')); // big ticked again, the ticks in it gone
+        assert_eq!(ticked(&mut v), ["big"]);
+        // Painting on over rows in a ticked folder changes nothing.
+        text(&mut v, 120, 40);
+        let rows = v.hits.rows;
+        let top = browse(&mut v).top;
+        let (y4, y6) = (rows.y + (4 - top) as u16, rows.y + (6 - top) as u16);
+        mouse(
+            &mut v,
+            MouseEventKind::Down(MouseButton::Left),
+            rows.x + 3,
+            y4,
+        );
+        mouse(&mut v, drag, rows.x + 3, y6);
+        assert_eq!(ticked(&mut v), ["big"]);
+        assert!(cache.join("big/inner/f4").exists());
+    }
+
+    #[test]
+    fn a_drag_from_a_tick_box_gives_the_rows_the_state_it_took() {
+        let (_t, home) = home("view-box-drag");
+        let mut v = ready(policy(&home, None), &home.join(".cache"));
+        for _ in 0..3 {
+            key(&mut v, KeyCode::Char(' ')); // big, linked, small
+        }
+        text(&mut v, 120, 40);
+        let ((small, _), (big, _)) = (box_of(&mut v, "small"), box_of(&mut v, "big"));
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        mouse(
+            &mut v,
+            MouseEventKind::Down(MouseButton::Left),
+            small.x,
+            small.y,
+        );
+        assert_eq!(ticked(&mut v), ["big", "linked"], "the click unticked it");
+        mouse(&mut v, drag, small.x, big.y);
+        assert!(
+            ticked(&mut v).is_empty(),
+            "and the drag unticks the rows it goes over"
+        );
+        mouse(
+            &mut v,
+            MouseEventKind::Up(MouseButton::Left),
+            small.x,
+            big.y,
+        );
+        mouse(
+            &mut v,
+            MouseEventKind::Down(MouseButton::Left),
+            big.x,
+            big.y,
+        );
+        mouse(&mut v, drag, big.x, small.y);
+        assert_eq!(ticked(&mut v), ["big", "linked", "small"]);
+    }
+
+    /// A trash in `home` holding two items, as a file manager leaves it.
+    fn fill_trash(home: &Path) -> PathBuf {
+        let t = home.join(".local/share/Trash");
+        fs::create_dir_all(t.join("files/old/deep")).unwrap();
+        fs::create_dir_all(t.join("info")).unwrap();
+        fs::write(t.join("files/old/deep/x"), vec![5u8; 50_000]).unwrap();
+        fs::write(t.join("files/note.txt"), b"note").unwrap();
+        for n in ["old", "note.txt"] {
+            let info = "[Trash Info]\nPath=/x\nDeletionDate=2026-01-01T00:00:00\n";
+            fs::write(t.join(format!("info/{n}.trashinfo")), info).unwrap();
+        }
+        t
+    }
+
+    /// The start screen, the Trash place selected.
+    fn on_trash_place(policy: Policy) -> View {
+        let mut v = View::new(policy, None);
+        let Screen::Start(s) = &mut v.screen else {
+            panic!("not the start screen")
+        };
+        s.sel = s.places.iter().position(|p| p.name == "Trash").unwrap();
+        v
+    }
+
+    #[test]
+    fn del_on_the_trash_place_asks_then_empties_it_for_good() {
+        let (_t, home) = home("view-empty");
+        let trash = fill_trash(&home);
+        let mut v = on_trash_place(policy(&home, None));
+        assert!(has(&text(&mut v, 120, 40), "Del empty the trash"));
+        key(&mut v, KeyCode::Delete);
+        settle(&mut v); // the trash's scan, then its tree with the dialog over it
+        let c = browse(&mut v).confirm.as_ref().unwrap();
+        assert!(c.empty && !c.on_move);
+        let lines = text(&mut v, 120, 40);
+        for s in [
+            "Empty the trash?",
+            "2 items, ",
+            "deleted permanently",
+            "cannot be undone",
+            "[ Empty Trash ]",
+            &trash.display().to_string(),
+        ] {
+            assert!(has(&lines, s), "{s}: {lines:#?}");
+        }
+        // The trash dialog's gate: Tab at once, Enter only after the wait.
+        key(&mut v, KeyCode::Tab);
+        key(&mut v, KeyCode::Enter);
+        assert!(browse(&mut v).confirm.is_some());
+        assert!(trash.join("files/note.txt").exists());
+        age(&mut v);
+        key(&mut v, KeyCode::Enter);
+        assert!(browse(&mut v).emptying.is_some());
+        assert!(v.next_wake().is_some(), "watches it");
+        assert!(has(&text(&mut v, 120, 40), "Emptying the trash"));
+        assert_eq!(key(&mut v, KeyCode::Down), Outcome::None, "keys wait");
+        for _ in 0..5000 {
+            v.tick();
+            if !matches!(&v.screen, Screen::Browse(b) if b.emptying.is_some()) {
+                break;
+            }
+            sleep(Duration::from_millis(1));
+        }
+        settle(&mut v); // then the trash scanned again
+        let lines = text(&mut v, 120, 40);
+        assert!(
+            has(&lines, "Emptied the trash: 2 items deleted"),
+            "{lines:#?}"
+        );
+        for d in ["files", "info"] {
+            assert_eq!(fs::read_dir(trash.join(d)).unwrap().count(), 0, "{d}");
+        }
+        // Del on its row again: nothing in it.
+        key(&mut v, KeyCode::Home);
+        key(&mut v, KeyCode::Delete);
+        assert!(browse(&mut v).confirm.is_none());
+        assert_eq!(v.message.as_deref(), Some("The trash is empty"));
+    }
+
+    #[test]
+    fn emptying_the_trash_is_off_when_read_only_and_asked_from_its_row() {
+        let (_t, home) = home("view-empty-ro");
+        let trash = fill_trash(&home);
+        let ro = policy(&home, Some("read-only: test".into()));
+        let mut v = on_trash_place(ro);
+        assert!(!has(&text(&mut v, 120, 40), "Del empty"));
+        assert_eq!(key(&mut v, KeyCode::Delete), Outcome::None);
+        assert!(matches!(v.screen, Screen::Start(_)));
+        // Browsing the trash: Del on its own row asks to empty it, and Esc keeps it all.
+        let mut v = ready(policy(&home, None), &trash);
+        key(&mut v, KeyCode::Home);
+        assert!(has(&text(&mut v, 120, 40), "Del empty the trash"));
+        key(&mut v, KeyCode::Delete);
+        assert!(browse(&mut v).confirm.as_ref().is_some_and(|c| c.empty));
+        key(&mut v, KeyCode::Esc);
+        assert!(browse(&mut v).confirm.is_none());
+        assert!(trash.join("files/old/deep/x").exists());
+    }
+
+    #[test]
+    fn dragging_over_rows_ticks_them_and_dragging_back_unticks() {
+        let (_t, home) = home("view-drag");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &cache);
+        let f0 = browse(&mut v)
+            .tree
+            .find(&cache.join("big/inner/f0"))
+            .unwrap();
+        browse(&mut v).select(f0); // big and inner open
+        text(&mut v, 120, 40);
+        let (rows, x) = (v.hits.rows, v.hits.rows.x + 3);
+        let at = |v: &mut View, i: usize| rows.y + (i - browse(v).top) as u16;
+        let names = |v: &mut View, r: std::ops::RangeInclusive<usize>| {
+            let b = browse(v);
+            let mut n: Vec<String> = b.rows[r]
+                .iter()
+                .map(|r| b.tree.name(r.0).to_string_lossy().into_owned())
+                .collect();
+            n.sort();
+            n
+        };
+        // From the first of inner's files (rows: .cache, big, inner, twenty files, two more).
+        let a = 3;
+        let (ya, y2) = (at(&mut v, a), at(&mut v, a + 2));
+        mouse(&mut v, MouseEventKind::Down(MouseButton::Left), x, ya);
+        assert!(ticked(&mut v).is_empty(), "a click ticks nothing");
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        assert_eq!(mouse(&mut v, drag, x, y2), Outcome::Redraw);
+        assert_eq!(ticked(&mut v), names(&mut v, a..=a + 2));
+        assert_eq!(browse(&mut v).cursor, a + 2, "the cursor follows");
+        mouse(&mut v, drag, x, y2 - 1);
+        assert_eq!(ticked(&mut v), names(&mut v, a..=a + 1), "back: one off");
+        mouse(&mut v, MouseEventKind::Up(MouseButton::Left), x, y2 - 1);
+        assert_eq!(mouse(&mut v, drag, x, y2), Outcome::None, "over: no drag");
+        // A new drag adds to what is ticked.
+        let (y5, y6) = (at(&mut v, a + 5), at(&mut v, a + 6));
+        mouse(&mut v, MouseEventKind::Down(MouseButton::Left), x, y5);
+        mouse(&mut v, drag, x, y6);
+        assert_eq!(ticked(&mut v).len(), 2 + 2);
+        mouse(&mut v, MouseEventKind::Up(MouseButton::Left), x, y6);
+        // Up past the rows: towards the top, never the shown folder's row.
+        browse(&mut v).ticked.clear();
+        let y1 = at(&mut v, 1);
+        browse(&mut v).top = 0;
+        mouse(&mut v, MouseEventKind::Down(MouseButton::Left), x, y1);
+        mouse(&mut v, drag, x, 0);
+        assert_eq!(ticked(&mut v), ["big"]);
+        mouse(&mut v, MouseEventKind::Up(MouseButton::Left), x, 0);
+        // Down past the rows of a short pane: the list scrolls as the cursor goes.
+        browse(&mut v).ticked.clear();
+        text(&mut v, 120, 12);
+        let rows = v.hits.rows;
+        let top = browse(&mut v).top;
+        let last = rows.bottom() - 1;
+        mouse(&mut v, MouseEventKind::Down(MouseButton::Left), x, last);
+        mouse(&mut v, drag, x, rows.bottom() + 1);
+        text(&mut v, 120, 12);
+        assert_eq!(browse(&mut v).top, top + 1, "scrolled one row");
+        assert_eq!(ticked(&mut v).len(), 2);
+    }
+
+    #[test]
+    fn ticks_stay_through_the_folder_shown_the_order_and_a_scan_again() {
+        let (_t, home) = home("view-tick-stay");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &home);
+        tick(&mut v, &cache.join("big/inner"));
+        tick(&mut v, &cache.join("small"));
+        select(&mut v, ".cache");
+        key(&mut v, KeyCode::Enter);
+        key(&mut v, KeyCode::Char('s'));
+        assert_eq!(ticked(&mut v), ["inner", "small"]);
+        key(&mut v, KeyCode::Char('r'));
+        settle(&mut v);
+        let b = browse(&mut v);
+        let mut paths: Vec<PathBuf> = b.ticked.iter().map(|&i| b.tree.path(i)).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [cache.join("big/inner"), cache.join("small")],
+            "by path"
+        );
+    }
+
+    /// The dialog's text at 120x40.
+    fn dialog_text(v: &mut View) -> Vec<String> {
+        text(v, 120, 40)
+    }
+
+    #[test]
+    fn del_with_ticks_takes_the_ticked_lists_the_refused_and_refuses_all_without_a_dialog() {
+        let (_t, home) = home("view-tick-del");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &home);
+        // Only refused: a message, no dialog.
+        select(&mut v, ".config");
+        key(&mut v, KeyCode::Char(' '));
+        select(&mut v, "Downloads");
+        key(&mut v, KeyCode::Delete);
+        assert!(browse(&mut v).confirm.is_none());
+        let msg = v.message.clone().unwrap();
+        // One refusal: .config (protected with all in it) is not opened up.
+        let want = "Cannot move to the trash: the ticked item cannot go; protected: ";
+        assert!(msg.starts_with(want), "{msg}");
+        // The refused one is listed with why.
+        tick(&mut v, &cache.join("big"));
+        tick(&mut v, &cache.join("small"));
+        select(&mut v, "Downloads"); // the cursor's row is not ticked: it does not go
+        key(&mut v, KeyCode::Delete);
+        let c = browse(&mut v).confirm.as_ref().unwrap();
+        let items: Vec<&PathBuf> = c.items.iter().map(|i| &i.1).collect();
+        assert_eq!(items, [&cache.join("big"), &cache.join("small")]);
+        assert_eq!(c.refused.len(), 1);
+        let lines = dialog_text(&mut v);
+        assert!(has(&lines, " Move 2 items to the trash? "), "{lines:#?}");
+        assert!(has(&lines, &cache.join("big").display().to_string()));
+        assert!(has(&lines, "Not moved (1):"));
+        let refused = format!("⊘ {}: protected: ", home.join(".config").display());
+        assert!(has(&lines, &refused), "{lines:#?}");
+        // One ticked item, nothing refused: the dialog for one, saying it is the ticked one.
+        key(&mut v, KeyCode::Esc);
+        key(&mut v, KeyCode::Esc); // the ticks
+        tick(&mut v, &cache.join("small"));
+        select(&mut v, ".config");
+        key(&mut v, KeyCode::Delete);
+        let lines = dialog_text(&mut v);
+        assert!(
+            has(&lines, " Move the ticked item to the trash? "),
+            "{lines:#?}"
+        );
+        assert!(has(&lines, &cache.join("small").display().to_string()));
+        // A ticked folder the guard refuses but whose items may go (Downloads protects only
+        // itself): it is not moved, what is in it is, each checked on its own.
+        key(&mut v, KeyCode::Esc);
+        key(&mut v, KeyCode::Esc);
+        tick(&mut v, &home.join("Downloads"));
+        key(&mut v, KeyCode::Delete);
+        let c = browse(&mut v).confirm.as_ref().unwrap();
+        assert_eq!(c.items[0].1, home.join("Downloads/linked"));
+        assert_eq!((c.items.len(), c.refused.len()), (1, 1));
+        assert_eq!(c.refused[0].0, home.join("Downloads"));
+        let lines = dialog_text(&mut v);
+        assert!(has(&lines, " Move 1 item to the trash? "), "{lines:#?}");
+    }
+
+    #[test]
+    fn a_drag_ends_with_any_key_and_with_new_rows() {
+        let (_t, home) = home("view-drag-stale");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &cache);
+        let f0 = browse(&mut v)
+            .tree
+            .find(&cache.join("big/inner/f0"))
+            .unwrap();
+        browse(&mut v).select(f0);
+        text(&mut v, 120, 40);
+        let (rows, x) = (v.hits.rows, v.hits.rows.x + 3);
+        let press = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let y = |i: u16| rows.y + i;
+        // Pressed on a file; a key collapses inner: the rows shrink. A drag then does nothing.
+        mouse(&mut v, press, x, y(20));
+        select(&mut v, "inner");
+        key(&mut v, KeyCode::Left);
+        assert!(!row_shown(&mut v, "f0"));
+        assert_eq!(mouse(&mut v, drag, x, y(24)), Outcome::None);
+        assert!(ticked(&mut v).is_empty());
+        // Pressed, then Space ticks another row: a drag does not take that tick away.
+        mouse(&mut v, press, x, y(1));
+        select(&mut v, "small");
+        key(&mut v, KeyCode::Char(' '));
+        mouse(&mut v, drag, x, y(2));
+        assert_eq!(ticked(&mut v), ["small"]);
+        // A release lost (outside the window), then a new order: a stray drag does nothing.
+        mouse(&mut v, press, x, y(1));
+        key(&mut v, KeyCode::Char('s'));
+        assert_eq!(mouse(&mut v, drag, x, y(3)), Outcome::None);
+        assert_eq!(ticked(&mut v), ["small"]);
+    }
+
+    #[test]
+    fn page_down_never_splits_a_path_so_reading_page_by_page_moves_them() {
+        let (_t, home) = home("view-tick-pages");
+        let many = home.join(".cache/many");
+        fs::create_dir(&many).unwrap();
+        fs::write(many.join("a"), b"x").unwrap(); // one line
+        for i in 0..20 {
+            // Two lines each in a 76-cell list.
+            let name = format!("item-{i:02}-with-a-name-long-enough-to-take-a-second-line-here");
+            fs::write(many.join(name), b"x").unwrap();
+        }
+        let mut v = ready(policy(&home, None), &many);
+        let b = browse(&mut v);
+        b.ticked = b.rows[1..].iter().map(|r| r.0).collect();
+        key(&mut v, KeyCode::Delete);
+        arm(&mut v);
+        text(&mut v, 120, 20);
+        for _ in 0..10 {
+            key(&mut v, KeyCode::PageDown);
+            text(&mut v, 120, 20);
+        }
+        assert!(
+            browse(&mut v).confirm.as_ref().unwrap().fits,
+            "every path shown whole"
+        );
+        // End, then more: no overflow.
+        key(&mut v, KeyCode::End);
+        key(&mut v, KeyCode::Down);
+        key(&mut v, KeyCode::PageDown);
+        mouse(&mut v, MouseEventKind::ScrollDown, 60, 10);
+        text(&mut v, 120, 20);
+    }
+
+    #[test]
+    fn the_dialog_for_many_moves_them_only_once_every_path_was_shown() {
+        let (_t, home) = home("view-tick-many");
+        let cache = home.join(".cache");
+        let many = cache.join("many");
+        fs::create_dir(&many).unwrap();
+        for i in 0..30 {
+            fs::write(many.join(format!("item-{i:02}")), b"x").unwrap();
+        }
+        let mut v = ready(policy(&home, None), &many);
+        let b = browse(&mut v);
+        b.ticked = b.rows[1..].iter().map(|r| r.0).collect();
+        key(&mut v, KeyCode::Delete);
+        arm(&mut v);
+        // 120x20: twelve of the thirty paths at a time.
+        let lines = text(&mut v, 120, 20);
+        assert!(has(&lines, "lines 1-12 of 30"), "{lines:#?}");
+        assert!(!browse(&mut v).confirm.as_ref().unwrap().fits);
+        let (_, moving) = v.hits.buttons.unwrap();
+        v.last_click = None;
+        click(&mut v, moving.x + 2, moving.y);
+        assert!(
+            many.join("item-00").exists(),
+            "not all shown: nothing moves"
+        );
+        // End jumps to the last ones: those in between were never shown.
+        key(&mut v, KeyCode::End);
+        assert!(has(&text(&mut v, 120, 20), "lines 19-30 of 30"));
+        key(&mut v, KeyCode::Enter);
+        assert!(many.join("item-00").exists() && browse(&mut v).confirm.is_some());
+        // The wheel and the keys show the rest.
+        mouse(&mut v, MouseEventKind::ScrollUp, 60, 10);
+        mouse(&mut v, MouseEventKind::ScrollUp, 60, 10);
+        text(&mut v, 120, 20);
+        key(&mut v, KeyCode::PageUp);
+        text(&mut v, 120, 20);
+        assert!(
+            browse(&mut v).confirm.as_ref().unwrap().fits,
+            "every path shown"
+        );
+        // Too small a window takes the move back.
+        text(&mut v, 120, 10);
+        assert!(!browse(&mut v).confirm.as_ref().unwrap().fits);
+        text(&mut v, 120, 20);
+        key(&mut v, KeyCode::Enter);
+        assert!((0..30).all(|i| !many.join(format!("item-{i:02}")).exists()));
+        assert_eq!(
+            v.message.as_deref(),
+            Some("Moved 30 items to the trash, 122.9 kB - freed when the trash is emptied")
+        );
+        assert!(
+            matches!(v.screen, Screen::Refreshing(..)),
+            "then scanned again"
+        );
+        assert!(saved(&v).ticked.is_empty() && v.done);
+        settle(&mut v);
+        assert!(ticked(&mut v).is_empty());
+    }
+
+    #[test]
+    fn a_confirm_moves_each_through_the_guard_and_the_refused_stay_ticked() {
+        let (_t, home) = home("view-tick-move");
+        let cache = home.join(".cache");
+        let mut v = ready(policy(&home, None), &home);
+        select(&mut v, ".config");
+        key(&mut v, KeyCode::Char(' '));
+        tick(&mut v, &cache.join("small"));
+        tick(&mut v, &cache.join("linked"));
+        key(&mut v, KeyCode::Delete);
+        arm(&mut v);
+        text(&mut v, 120, 40);
+        // Gone since the dialog opened: the guard refuses it then, and says so.
+        fs::rename(cache.join("linked"), home.join("linked-away")).unwrap();
+        key(&mut v, KeyCode::Enter);
+        assert!(!cache.join("small").exists());
+        let msg = v.message.clone().unwrap();
+        assert!(
+            msg.starts_with("Moved 1 item to the trash, 4.1 kB"),
+            "{msg}"
+        );
+        assert!(msg.contains("; 1 not moved: "), "{msg}");
+        settle(&mut v);
+        assert_eq!(ticked(&mut v), [".config"], "what did not go stays ticked");
+    }
+
     /// to look at: `cargo test -- --ignored --nocapture print_screens`.
     #[test]
     #[ignore = "prints screens to look at"]

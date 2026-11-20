@@ -2,6 +2,7 @@
 
 //! Drawing the view into a ratatui `Buffer`: cells, colours and text, nothing else.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::time::Duration;
@@ -14,13 +15,22 @@ use unicode_width::UnicodeWidthChar;
 use crate::guard::Policy;
 use crate::style::{Colors, Glyphs};
 use crate::sys;
-use crate::tree::{Tree, HARDLINK_DUP, LINKED, MOUNT, NOT_OWNED, PROTECTED, UNREADABLE};
+use crate::tree::{NodeId, Tree, HARDLINK_DUP, LINKED, LOCKED};
 use crate::treemap::{self, Item};
-use crate::view::{counted, Browse, Confirm, Field, Hits, Hover, Panes, Screen, Start, View};
+use crate::view::{counted, trash_items, Browse, Confirm, Emptying, Field, Hits, Hover};
+use crate::view::{Panes, Screen, Start, View};
 use crate::{fmt_size, Scan};
 
-/// The flags that keep an item from the trash, shown with a lock.
-const LOCKED: u16 = PROTECTED | NOT_OWNED | MOUNT | UNREADABLE;
+/// termdisk's version, at the end of the title bar.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The fewest cells a path in the title is cut to before other parts give way.
+const TITLE_MIN: usize = 10;
+/// The shortest line of the rest's list: a name of a letter, two spaces, the shortest size
+/// ("1.0 kB"), two spaces, a share in four cells.
+const REST_LINE_LEAST: usize = 15;
+/// Usage's bar: its cells, and the fewest it keeps when names need its room.
+const BAR: u16 = 8;
+const BAR_MIN: u16 = 3;
 
 /// The colours and glyphs of one frame, and the pointer where it may show hover (`None` where
 /// nothing under it takes a click: under the dialog, the help).
@@ -164,27 +174,55 @@ fn paint(v: &mut View, area: Rect, buf: &mut Buffer) {
     let sep = g.sep;
     // The status bar's items (wide enough only): they take the place of some hints.
     let items_fit = area.width >= 76;
-    let title = match &mut v.screen {
+    // The title's parts; termdisk and its version come last. The tree's starts with a path.
+    let title_path = matches!(v.screen, Screen::Browse(_) | Screen::Refreshing(..));
+    let mut title: Vec<String> = match &mut v.screen {
         Screen::Start(s) => {
-            hints = format!("{up_down} choose  Enter scan  ? help  q quit");
+            let del = match s.places[s.sel].path == v.policy.trash_dir() {
+                true if v.policy.read_only().is_none() => "Del empty the trash  ",
+                _ => "",
+            };
+            hints = format!("{up_down} choose  Enter scan  {del}? help  q quit");
             start(s, &v.policy, body, buf, &mut hits, &look);
-            format!("choose what to look at  {sep}  termdisk")
+            vec!["choose what to look at".into()]
         }
         Screen::Scanning(s) => {
             hints.push_str("Esc stop  q quit");
-            scanning(s, v.scan_started.elapsed(), body, buf, &look)
+            scanning(s, v.scan_started.elapsed(), body, buf, &look);
+            vec!["scanning".into()]
+        }
+        // Scanning again: the last tree is gone (two would double the memory), so the scan's
+        // card, under the folder's path; the message (what a trash did) stays in the status bar.
+        Screen::Refreshing(s, saved) => {
+            hints.push_str("scanning again  Esc stop  q quit");
+            scanning(s, v.scan_started.elapsed(), body, buf, &look);
+            vec![shown(saved.root.as_os_str()), "scanning again".into()]
         }
         Screen::Browse(b) => {
             let read_only = v.policy.read_only().is_some();
             hints = format!("{up_down} move  {right_left} open  Enter zoom  {back} up  ");
-            if !read_only {
-                hints.push_str("Del trash  ");
+            let on_trash = b.tree.path(b.rows[b.cursor].0) == v.policy.trash_dir();
+            match (read_only, on_trash) {
+                (true, _) => {}
+                (false, true) => hints.push_str("Del empty the trash  "),
+                (false, false) => hints.push_str("Del trash  "),
             }
             match items_fit {
                 true => hints.push_str("v panes  r rescan  q quit"),
                 false => hints.push_str(
                     "o open  c copy  a size  t letters  v panes  r rescan  ? help  q quit",
                 ),
+            }
+            if !b.ticked.is_empty() {
+                let size = fmt_size(b.ticked_size(v.apparent));
+                let del = match read_only {
+                    true => String::new(),
+                    false => format!("Del trash them  {sep}  "),
+                };
+                hints = format!("{} ticked, {size}  {sep}  {del}Esc clear", b.ticked.len());
+            }
+            if b.emptying.is_some() {
+                hints = "emptying the trash  Esc stop  q quit".into();
             }
             // Under the dialog nothing takes a click, so nothing there shows hover.
             let panes = Look {
@@ -193,6 +231,9 @@ fn paint(v: &mut View, area: Rect, buf: &mut Buffer) {
             };
             let modes = (v.apparent, v.by_age);
             browse(b, modes, v.panes, body, buf, &mut hits, &panes);
+            if let Some(e) = &b.emptying {
+                emptying(e, v.scan_started.elapsed(), body, buf, &look);
+            }
             let zoom = b.tree.node(b.zoom);
             let size = if v.apparent {
                 zoom.apparent
@@ -204,27 +245,26 @@ fn paint(v: &mut View, area: Rect, buf: &mut Buffer) {
             } else {
                 "disk usage"
             };
-            let only = if b.trash_reaches || read_only {
-                String::new()
-            } else {
-                format!("  {sep}  look only: on another filesystem than the trash")
-            };
             let path = shown(b.tree.path(b.zoom).as_os_str());
-            format!(
-                "{path}  {sep}  {} ({kind}){only}  {sep}  termdisk",
-                fmt_size(size)
-            )
+            let mut parts = vec![path, format!("{} ({kind})", fmt_size(size))];
+            if !b.trash_reaches && !read_only {
+                parts.push("look only: on another filesystem than the trash".into());
+            }
+            parts
         }
-        Screen::Gone => String::new(),
+        Screen::Gone => Vec::new(),
     };
+    title.push(format!("termdisk v{VERSION}"));
     // termcode's title bar: the text in the middle.
     let st = Style::new().bg(c.title_bg).fg(c.title_fg);
     buf.set_style(Rect::new(area.x, area.y, area.width, 1), st);
-    // The close button takes the last 3 cells; the title keeps clear of it on both sides.
-    let t = fit_end(&title, area.width.saturating_sub(8) as usize, g.cut);
-    let x = area.x + (area.width - width(&t) as u16) / 2;
-    put(buf, x, area.y, &t, area.width, st);
+    // The close button takes the last 3 cells; the title, in the middle, keeps clear of it on
+    // both sides.
     let close = Rect::new(area.right() - 3, area.y, 3, 1);
+    let room = area.width.saturating_sub(8) as usize;
+    let t = fit_title(&title, title_path, sep, room, g.cut);
+    let tw = width(&t) as u16;
+    put(buf, area.x + (area.width - tw) / 2, area.y, &t, tw, st);
     let cross = match look.over(close) && v.close_works() {
         true => Style::new().bg(c.close_hover).fg(c.button_fg),
         false => st.fg(c.close_fg),
@@ -291,6 +331,35 @@ fn paint(v: &mut View, area: Rect, buf: &mut Buffer) {
     v.hits = hits;
     // What the pointer is over in this drawing: a move only redraws when that changes.
     v.hover = v.pointer.map_or(Hover::Nothing, |(x, y)| v.hover_at(x, y));
+    // Over a lock: why it is locked, in a box at that lock (from the scan and the policy only:
+    // nothing here waits on the disk).
+    let pointed = |r: &Rect| v.pointer.is_some_and(|(x, y)| r.contains((x, y).into()));
+    let lock = v.hits.locks.iter().find(|l| pointed(&l.0)).map(|l| l.0);
+    if let (Hover::Lock(id), Some(at), Screen::Browse(b)) = (v.hover, lock, &v.screen) {
+        let why = crate::view::lock_reason(&b.tree, id, &v.policy);
+        tooltip(&why, at, area, buf, &look);
+    }
+}
+
+/// `text` in a framed box under `anchor` (over it where there is no room below), from its
+/// column or as far right as it fits, inside `area`. The frame shows it in 16 colours too,
+/// where the box is as black as the pane.
+fn tooltip(text: &str, anchor: Rect, area: Rect, buf: &mut Buffer, look: &Look) {
+    let text = clean(text);
+    let w = (width(&text) as u16 + 4).min(area.width);
+    if w < 6 || area.height < 3 {
+        return;
+    }
+    let x = anchor.x.min(area.right() - w).max(area.x);
+    let y = match anchor.y + 4 <= area.bottom() {
+        true => anchor.y + 1,
+        false => anchor.y.saturating_sub(3).max(area.y),
+    };
+    let r = Rect::new(x, y, w, 3);
+    let style = Style::new().bg(look.c.widget_bg).fg(look.c.widget_fg);
+    frame(r, "", style, look, buf);
+    let text = fit_end(&text, w as usize - 4, look.g.cut);
+    put(buf, r.x + 2, r.y + 1, &text, w - 4, style);
 }
 
 fn start(s: &Start, policy: &Policy, area: Rect, buf: &mut Buffer, hits: &mut Hits, look: &Look) {
@@ -360,7 +429,7 @@ fn start(s: &Start, policy: &Policy, area: Rect, buf: &mut Buffer, hits: &mut Hi
 /// A running scan: a card with a spinner, the counts, the rate and the folder being read. It
 /// moves only when drawn, and a scan is drawn every 100 ms (`View::tick`), so nothing wakes
 /// for it.
-fn scanning(s: &Scan, since: Duration, area: Rect, buf: &mut Buffer, look: &Look) -> String {
+fn scanning(s: &Scan, since: Duration, area: Rect, buf: &mut Buffer, look: &Look) {
     use std::sync::atomic::Ordering::Relaxed;
     let (c, g) = (&look.c, look.g);
     let p = s.progress();
@@ -408,7 +477,43 @@ fn scanning(s: &Scan, since: Duration, area: Rect, buf: &mut Buffer, look: &Look
     let current = clean(&current.to_string_lossy());
     let current = fit_middle(&current, w as usize, g.cut);
     put(buf, x, y + 1, &current, w, style.fg(c.dim));
-    format!("scanning  {}  termdisk", g.sep)
+}
+
+/// The trash being emptied: a card over the tree (which waits meanwhile) with a spinner and
+/// what has gone so far. Drawn every 100 ms (`View::tick`), as a scan's card.
+fn emptying(e: &Emptying, since: Duration, area: Rect, buf: &mut Buffer, look: &Look) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (c, g) = (&look.c, look.g);
+    let spin = g.spin[(since.as_millis() / 100) as usize % g.spin.len()];
+    let (items, bytes) = (e.tally.items.load(Relaxed), e.tally.bytes.load(Relaxed));
+    let done = format!(
+        "{spin} {items} of {} deleted  {}  {} freed",
+        count(e.of as u64, "item"),
+        g.dot,
+        fmt_size(bytes)
+    );
+    let stop = match e.tally.stop.load(Relaxed) {
+        true => "Stopping: the item it is at stays in the trash, partly deleted",
+        false => "Esc stops it: the item it is at stays in the trash, partly deleted",
+    };
+    let card = Rect::new(
+        area.x + area.width.saturating_sub(72) / 2,
+        area.y + area.height.saturating_sub(6) / 2,
+        area.width.min(72),
+        6.min(area.height),
+    );
+    let style = Style::new().bg(c.widget_bg).fg(c.widget_fg);
+    frame(card, " Emptying the trash ", style, look, buf);
+    let (x, w) = (card.x + 2, card.width.saturating_sub(4));
+    put(
+        buf,
+        x,
+        card.y + 2,
+        &done,
+        w,
+        style.add_modifier(Modifier::BOLD),
+    );
+    put(buf, x, card.y + 3, stop, w, style.fg(c.dim));
 }
 
 /// `modes`: apparent sizes, the treemap by age.
@@ -467,6 +572,24 @@ fn tree_pane(
     // (and their clicks) end before it.
     let bar_x = r.right() - 1;
     let r = Rect::new(r.x, r.y, r.width - 1, r.height);
+    let rows = Rect::new(r.x, r.y + 1, r.width, r.height.saturating_sub(1));
+    let h = rows.height as usize;
+    b.page = h.max(1);
+    if b.cursor < b.top {
+        b.top = b.cursor;
+    } else if b.cursor >= b.top + h {
+        b.top = b.cursor + 1 - h;
+    }
+    // Never scrolled past where the rows fill the pane (a scan again that keeps the selected
+    // row on its line may ask for that): no empty lines below while rows above are hidden.
+    b.top = b.top.min(b.rows.len().saturating_sub(h.max(1)));
+    // Once a frame, not a walk below each row: a drag can tick thousands.
+    let part = b.partly_ticked();
+    let shown_rows: Vec<(usize, NodeId, u16, Label)> = (b.rows.iter().enumerate())
+        .skip(b.top)
+        .take(h)
+        .map(|(i, &(id, depth))| (i, id, depth, label(b, id, depth, &part, g)))
+        .collect();
     // A click on a heading sorts by it (Usage by size); the sorted one has an arrow.
     let sort = b.sort;
     let field = |title: &str| match title {
@@ -477,10 +600,15 @@ fn tree_pane(
     };
     let sorted = |title: &str| title != "Usage" && field(title) == sort.by;
     // In a narrow pane columns go, Items first, so names keep 24 cells; the sorted one stays
-    // while another can go, and goes too where it alone has no room. Usage is a percentage, a
-    // space and a bar of 8.
-    let mut cols: Vec<(&str, u16)> =
-        vec![("Usage", 13), ("Size", 9), ("Items", 7), ("Modified", 10)];
+    // while another can go, and goes too where it alone has no room. Which columns show is
+    // decided at their full widths, so it does not change as rows scroll. Usage is a
+    // percentage, a space and a bar.
+    let mut cols: Vec<(&str, u16)> = vec![
+        ("Usage", 5 + BAR),
+        ("Size", 9),
+        ("Items", 7),
+        ("Modified", 10),
+    ];
     let fits = |cols: &[(&str, u16)]| r.width >= 24 + cols.iter().map(|c| c.1 + 1).sum::<u16>();
     for drop in ["Items", "Modified", "Usage", "Size"] {
         if fits(&cols) {
@@ -492,6 +620,37 @@ fn tree_pane(
     }
     if !fits(&cols) {
         cols.clear();
+    }
+    // Then each column takes only what its heading and the rows on screen need (the bar down
+    // to `BAR_MIN`), and the cells saved go to the names first, as far as the rows on screen
+    // need them, then back to the bar. The scan root's row, its whole path, is left out: the
+    // title shows that path.
+    let full: u16 = cols.iter().map(|c| c.1 + 1).sum();
+    let heading_w = |title: &str| title.len() as u16 + u16::from(sorted(title));
+    let (mut size_w, mut items_w, mut name_need) = (heading_w("Size"), heading_w("Items"), 0);
+    for (_, id, _, l) in &shown_rows {
+        let n = b.tree.node(*id);
+        let size = fmt_size(if apparent { n.apparent } else { n.alloc });
+        size_w = size_w.max(width(&size) as u16);
+        if n.is_dir() {
+            items_w = items_w.max(b.tree.items(*id).to_string().len() as u16);
+        }
+        if *id != 0 {
+            name_need = name_need.max(width(&l.full) as u16 + 2);
+        }
+    }
+    for (title, w) in &mut cols {
+        *w = (*w).min(match *title {
+            "Usage" => 5 + BAR_MIN,
+            "Size" => size_w,
+            "Items" => items_w,
+            _ => *w,
+        });
+    }
+    let saved = full - cols.iter().map(|c| c.1 + 1).sum::<u16>();
+    let to_names = saved.min(name_need.saturating_sub(r.width.saturating_sub(full)));
+    if let Some(usage) = cols.iter_mut().find(|c| c.0 == "Usage") {
+        usage.1 += (saved - to_names).min(BAR - BAR_MIN);
     }
     let right: u16 = cols.iter().map(|c| c.1 + 1).sum();
     let name_w = r.width.saturating_sub(right);
@@ -525,26 +684,20 @@ fn tree_pane(
         heading(title, Rect::new(x + 1, r.y, *w, 1), true);
         x += w + 1;
     }
-    let rows = Rect::new(r.x, r.y + 1, r.width, r.height.saturating_sub(1));
     hits.rows = rows;
     hits.scrollbar = Rect::new(bar_x, rows.y, 1, rows.height);
-    let h = rows.height as usize;
-    b.page = h.max(1);
-    if b.cursor < b.top {
-        b.top = b.cursor;
-    } else if b.cursor >= b.top + h {
-        b.top = b.cursor + 1 - h;
-    }
-    b.top = b.top.min(b.rows.len().saturating_sub(1));
-    for (i, &(id, depth)) in b.rows.iter().enumerate().skip(b.top).take(h) {
+    for (i, id, depth, l) in shown_rows {
         let y = rows.y + (i - b.top) as u16;
         let n = b.tree.node(id);
         let selected = i == b.cursor;
-        let locked = n.flags & LOCKED != 0;
-        // The selection: its colours, bold, and a mark at the left edge (no colour needed).
-        let bg = match look.over(Rect::new(r.x, y, r.width, 1)) {
-            true => c.hover_bg,
-            false => c.side_bg,
+        let locked = l.locked;
+        let ticked = b.shows_ticked(id);
+        // The selection: its colours, bold, and a mark at the left edge (no colour needed). A
+        // ticked row: its tint, under the tick.
+        let bg = match (look.over(Rect::new(r.x, y, r.width, 1)), ticked) {
+            (true, _) => c.hover_bg,
+            (false, true) => c.tick_bg,
+            (false, false) => c.side_bg,
         };
         let style = if selected {
             Style::new()
@@ -560,41 +713,47 @@ fn tree_pane(
         if selected {
             put(buf, r.x, y, g.mark, 1, style.fg(c.focus));
         }
-        // termcode's row: [indent][chevron][space][icon][space][name]; each level of the indent
-        // is a guide and a space.
-        let open = b.open.contains(&id) || id == b.zoom;
-        let (chev, icon) = match (n.is_dir(), open) {
-            (true, true) => (g.open, g.folder_open),
-            (true, false) => (g.closed, g.folder),
-            _ => (" ", g.file),
-        };
-        let levels = depth.min(12);
-        let indent = format!("{} ", g.guide).repeat(levels as usize);
-        let lead = format!("{indent}{chev} {}", icon_gap(icon));
-        let mut name = name_of(b, id);
-        if n.is_dir() && id != 0 {
-            name.push('/');
-        }
-        let lock = if locked {
-            format!(" {}", g.lock)
-        } else {
-            String::new()
-        };
-        let link = if n.flags & (LINKED | HARDLINK_DUP) != 0 {
-            " (hard link)"
-        } else {
-            ""
-        };
-        let full = format!("{lead}{name}{lock}{link}");
+        let Label {
+            indent,
+            chev,
+            icon,
+            boxed,
+            mark,
+            lead,
+            name,
+            full,
+            levels,
+            ..
+        } = l;
         let room = name_w.saturating_sub(2) as usize;
         let shown = fit_end(&full, room, g.cut);
         put(buf, r.x + 1, y, &shown, name_w, style);
+        // Only as far as the text is shown, not over where it is cut.
+        let cut = usize::from(width(&full) > room);
+        let end = r.x + 1 + width(&shown).saturating_sub(cut) as u16;
+        let x = r.x + 1 + width(&indent) as u16;
+        // The tick box, drawn whole: ticked or holding ticks in the tick's colour, else dim
+        // (the selected row keeps its own); underlined under the pointer. A click on it ticks
+        // the row, but on the shown folder's row (a box there only says it is ticked).
+        let at = Rect::new(x + 2, y, width(icon) as u16, 1);
+        if boxed && at.right() <= end {
+            let st = match (selected, mark) {
+                (true, _) => style,
+                (false, 0) => style.fg(c.dim),
+                (false, _) => style.fg(c.tick_fg),
+            };
+            let st = match look.over(at) {
+                true => st.add_modifier(Modifier::UNDERLINED),
+                false => st,
+            };
+            put(buf, at.x, y, icon, at.width, st);
+            if id != b.zoom {
+                hits.boxes.push((at, id));
+            }
+        }
         // Each level's colour on its guide, and on the chevron and folder icon of a row at that
-        // level (the selected row keeps its own); only as far as the text is shown, not over
-        // where it is cut.
+        // level (the selected row keeps its own).
         if !selected {
-            let cut = usize::from(width(&full) > room);
-            let end = r.x + 1 + width(&shown).saturating_sub(cut) as u16;
             let mut paint = |x: u16, glyph: &str, fg: Color| {
                 if x < end {
                     put(buf, x, y, glyph, 1, style.fg(fg));
@@ -604,16 +763,16 @@ fn tree_pane(
             for d in 0..levels {
                 paint(r.x + 1 + 2 * d, g.guide, level(d));
             }
-            let x = r.x + 1 + width(&indent) as u16;
             let fg = if n.is_dir() { level(depth) } else { c.icon_fg };
             paint(x, chev, fg);
-            if !icon.is_empty() {
+            if !icon.is_empty() && !boxed {
                 paint(x + 2, icon, fg);
             }
         }
         if locked && width(&full) <= room {
             let x = r.x + 1 + width(&lead) as u16 + width(&name) as u16 + 1;
             put(buf, x, y, g.lock, 1, style.fg(c.lock));
+            hits.locks.push((Rect::new(x - 1, y, 2, 1), id));
         }
         let parent = b
             .tree
@@ -643,11 +802,11 @@ fn tree_pane(
                     );
                 }
                 "Items" if n.is_dir() => {
-                    let t = format!("{:>w$}", n.items, w = *w as usize);
+                    let t = format!("{:>w$}", b.tree.items(id), w = *w as usize);
                     put(buf, x + 1, y, &t, *w, quiet);
                 }
                 "Modified" => {
-                    let t = &sys::local_datetime(n.mtime)[..10];
+                    let t = &sys::local_datetime(n.mtime.into())[..10];
                     put(buf, x + 1, y, t, *w, quiet);
                 }
                 _ => {}
@@ -662,6 +821,75 @@ fn tree_pane(
         for y in rows.y + start..rows.y + start + len {
             put(buf, bar_x, y, g.slider, 1, st);
         }
+    }
+}
+
+/// A tree row's text, termcode's row: [indent][chevron][space][icon][space][name], then the lock
+/// and the hard-link note; each level of the indent is a guide and a space.
+struct Label {
+    indent: String,
+    chev: &'static str,
+    icon: &'static str,
+    /// The icon is the row's tick box, and which (`Glyphs::boxes`).
+    boxed: bool,
+    mark: usize,
+    /// The indent, the chevron and the icon, with their spaces.
+    lead: String,
+    name: String,
+    full: String,
+    levels: u16,
+    locked: bool,
+}
+
+/// `part`: the folders holding a ticked item (`Browse::partly_ticked`).
+fn label(b: &Browse, id: NodeId, depth: u16, part: &HashSet<NodeId>, g: &'static Glyphs) -> Label {
+    let n = b.tree.node(id);
+    let locked = n.flags & LOCKED != 0;
+    let open = b.shows_open(id);
+    let (chev, icon) = match (n.is_dir(), open) {
+        (true, true) => (g.open, g.folder_open),
+        (true, false) => (g.closed, g.folder),
+        _ => (" ", ""), // a file's row has its tick box
+    };
+    // Every row but the shown folder's has its tick box in its icon's place: ticked (itself or
+    // with a folder above), else holding a ticked item, else not. The shown folder's row keeps
+    // its icon unless it is ticked (it takes no tick, but may lie in a ticked folder).
+    let mark = match b.shows_ticked(id) {
+        true => 1,
+        false => 2 * usize::from(part.contains(&id)),
+    };
+    let boxed = id != b.zoom || mark == 1;
+    let icon = match boxed {
+        true => g.boxes[mark],
+        false => icon,
+    };
+    let levels = depth.min(12);
+    let indent = format!("{} ", g.guide).repeat(levels as usize);
+    let lead = format!("{indent}{chev} {}", icon_gap(icon));
+    let mut name = name_of(b, id);
+    if n.is_dir() && id != 0 {
+        name.push('/');
+    }
+    let lock = match locked {
+        true => format!(" {}", g.lock),
+        false => String::new(),
+    };
+    let link = match n.flags & (LINKED | HARDLINK_DUP) != 0 {
+        true => " (hard link)",
+        false => "",
+    };
+    let full = format!("{lead}{name}{lock}{link}");
+    Label {
+        indent,
+        chev,
+        icon,
+        boxed,
+        mark,
+        lead,
+        name,
+        full,
+        levels,
+        locked,
     }
 }
 
@@ -686,9 +914,12 @@ fn slider(track: u16, total: usize, view: usize, off: usize, max_off: usize) -> 
 /// The treemap of the folder that holds the selected row (of the shown folder on its own row),
 /// largest first, under a legend: that folder's name and the classes on the map. The selected
 /// item's tile is blue, every other one in the next colour of `Colors::tiles` (`modes`: apparent
-/// sizes, the letters by age). Every tile shows its class as a letter too and has a frame where
-/// it has room (white on the selected one, which also has the mark in its corner): all inside
-/// the tile, so a click on them picks that tile.
+/// sizes, the letters by age). Every tile shows its class as a letter too, its whole name, its
+/// size and its share of the folder, never cut (the layout gives it the columns), and has a
+/// frame where it has room (white on the selected one, which also has the mark in its
+/// corner): all inside the tile, so a click on them picks that tile. The "+N items" tile lists
+/// what it holds, each line whole; a click there picks the tile (the lines take no clicks of
+/// their own).
 fn map_pane(
     b: &mut Browse,
     (apparent, by_age): (bool, bool),
@@ -700,13 +931,26 @@ fn map_pane(
     let (c, g) = (&look.c, look.g);
     let (folder, selected) = b.map_of();
     let kids = b.kids(folder).to_vec();
+    let b: &Browse = b;
     let sizes: Vec<u64> = kids
         .iter()
         .map(|&k| counted(b.tree.node(k), apparent))
         .collect();
     let selected = selected.and_then(|s| kids.iter().position(|&k| k == s));
-    // The "+N items" tile holds the N smallest items that are not empty (the last ones).
-    let not_empty = sizes.iter().filter(|&&s| s > 0).count();
+    // Each item's share of the folder on the map, as its row's Usage column shows it.
+    let whole = counted(b.tree.node(folder), apparent).max(1) as f64;
+    let share = |k: usize| percent(sizes[k] as f64 / whole);
+    let detail = |k: usize| format!("{}  {}", fmt_size(sizes[k]), share(k));
+    // The columns a tile's whole text takes, never cut: the class letter and the name on the
+    // frame's top edge, the size and share under it; the frame's two sides and the gutter.
+    // The rest's: "+N", where it shares a strip.
+    let cols = |item: Item| {
+        let text = match item {
+            Item::One(k) => (2 + width(&tile_name(b, kids[k], g))).max(width(&detail(k))),
+            Item::Rest(n) => width(&format!("+{n}")),
+        };
+        u16::try_from(text + 3).unwrap_or(u16::MAX)
+    };
     let (legend, r) = match r.height >= 3 {
         true => (Some(r.y), Rect::new(r.x, r.y + 1, r.width, r.height - 1)),
         false => (None, r),
@@ -718,8 +962,18 @@ fn map_pane(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
+    let tiles = treemap::layout(&sizes, r, cols);
+    // The "+N items" tile holds every item not empty without a tile of its own: the smallest,
+    // and any whose text is wider than the map.
+    let mut own = vec![false; kids.len()];
+    for t in &tiles {
+        if let Item::One(k) = t.item {
+            own[k] = true;
+        }
+    }
+    let in_rest = |k: usize| sizes[k] > 0 && !own[k];
     let mut shown = [false; 8];
-    for t in treemap::layout(&sizes, r) {
+    for t in tiles {
         let rect = t.rect;
         // A gap at the right and bottom keeps tiles of one colour apart.
         let fill = Rect::new(
@@ -728,30 +982,23 @@ fn map_pane(
             rect.width - u16::from(rect.width > 3),
             rect.height - u16::from(rect.height > 2),
         );
-        let (id, label, detail, class) = match t.item {
+        let (id, label, detail) = match t.item {
             Item::One(k) => {
                 let id = kids[k];
                 let n = b.tree.node(id);
                 let class = match by_age {
-                    true => age(n.mtime, now),
+                    true => age(n.mtime.into(), now),
                     false => kind(b.tree.name(id).as_bytes(), n.is_dir()),
                 };
                 shown[class] = true;
-                let mut name = name_of(b, id);
-                if n.is_dir() {
-                    name.push('/');
-                }
-                if n.flags & LOCKED != 0 {
-                    name.push(' ');
-                    name.push_str(g.lock);
-                }
-                (Some(id), name, fmt_size(sizes[k]), Some(class))
+                let label = format!("{} {}", classes[class].0, tile_name(b, id, g));
+                (Some(id), label, detail(k))
             }
-            Item::Rest(count) => (None, format!("+{count} items"), String::new(), None),
+            Item::Rest(_) => (None, String::new(), String::new()),
         };
         let chosen = selected.is_some_and(|s| match t.item {
             Item::One(k) => k == s,
-            Item::Rest(count) => s < not_empty && s + count >= not_empty,
+            Item::Rest(_) => in_rest(s),
         });
         let style = match (chosen, t.item) {
             (true, _) => Style::new()
@@ -762,30 +1009,60 @@ fn map_pane(
             (false, Item::Rest(_)) => Style::new().bg(c.rest_bg).fg(c.rest_fg),
         };
         buf.set_style(fill, style);
-        // Every tile has a frame where it has room: dark on the others, white on the selected.
-        let outlined = fill.width >= 4 && fill.height >= 3;
+        // The gutter row under the tile keeps the tile's colour in its upper half where the set
+        // has the glyph: half a row looks as wide as the one-column gap at the right.
+        if fill.height < rect.height && !g.half_row.is_empty() {
+            let gutter = Style::new().bg(c.bg).fg(style.bg.unwrap_or(c.bg));
+            for x in fill.x..fill.right() {
+                put(buf, x, fill.bottom(), g.half_row, 1, gutter);
+            }
+        }
+        // Every tile has a frame where it has room (the treemap gives every tile of its own
+        // that room): dark on the others, white on the selected. The name sits on its top edge
+        // and the size under it; the rest has no size, so two rows hold its frame.
+        let outlined = fill.width >= 4 && fill.height >= if detail.is_empty() { 2 } else { 3 };
         if outlined {
             let edge = if chosen { style } else { style.fg(c.bg) };
             outline(fill, edge, look, buf);
         }
         let w = fill.width.saturating_sub(1 + u16::from(outlined));
+        // The text is bold on every tile; the selected one shows by its colour, frame and mark.
+        let bold = style.add_modifier(Modifier::BOLD);
         let top = match look.over(rect) && !chosen {
-            true => style.add_modifier(Modifier::UNDERLINED),
-            false => style,
+            true => bold.add_modifier(Modifier::UNDERLINED),
+            false => bold,
         };
-        // The class letter first, kept however small the tile.
-        let label = match class {
-            Some(k) if w >= 3 => format!(
-                "{} {}",
-                classes[k].0,
-                fit_end(&label, w as usize - 2, g.cut)
-            ),
-            Some(k) => classes[k].0.to_string(),
-            None => fit_end(&label, w as usize, g.cut),
+        // A tile of its own has room for its whole text (`cols`). The rest's "+N items", or
+        // where that has no room "+N"; without a frame it starts at the tile's edge, under the
+        // selection's mark if that takes the first cell.
+        let (mut x, mut y, mut room) = (fill.x + 1, fill.y, w);
+        if let (Item::Rest(_), false) = (t.item, outlined) {
+            (x, room) = (fill.x, fill.width);
+            if chosen && fill.height > 1 {
+                y += 1;
+            } else if chosen {
+                (x, room) = (fill.x + 1, w);
+            }
+        }
+        let label = match t.item {
+            Item::One(_) => label,
+            Item::Rest(count) => rest_label(count, room as usize),
         };
-        put(buf, fill.x + 1, fill.y, &label, w, top);
-        if fill.height > 1 {
-            put(buf, fill.x + 1, fill.y + 1, &detail, w, style);
+        put(buf, x, y, &label, room, top);
+        // The lock ends the label: the pointer there says why.
+        if let Some(i) = id.filter(|&i| b.tree.node(i).flags & LOCKED != 0) {
+            let x = fill.x + width(&label) as u16; // the label's last cell
+            hits.locks.push((Rect::new(x - 1, fill.y, 2, 1), i));
+        }
+        if fill.height > 1 && !detail.is_empty() {
+            put(buf, fill.x + 1, fill.y + 1, &detail, w, bold);
+        }
+        if let (Item::Rest(count), true) = (t.item, outlined) {
+            let rest = (0..kids.len()).filter(|&k| in_rest(k));
+            let inside = Rect::new(fill.x + 1, fill.y + 1, w, fill.height.saturating_sub(2));
+            let lines = |k: usize| (tile_name(b, kids[k], g), fmt_size(sizes[k]), share(k));
+            let plain = style.remove_modifier(Modifier::BOLD);
+            rest_list(rest, count, lines, selected, inside, plain, buf);
         }
         if chosen {
             put(buf, fill.x, fill.y, g.mark, 1, style); // the selected tile, without colour
@@ -822,6 +1099,102 @@ fn map_pane(
     }
 }
 
+/// An item's name as its tile and the rest's list show it: `/` after a folder, the lock after
+/// what cannot be trashed itself.
+fn tile_name(b: &Browse, id: NodeId, g: &Glyphs) -> String {
+    let n = b.tree.node(id);
+    let mut name = name_of(b, id);
+    if n.is_dir() {
+        name.push('/');
+    }
+    if n.flags & LOCKED != 0 {
+        name.push(' ');
+        name.push_str(g.lock);
+    }
+    name
+}
+
+/// The rest's label in `room` cells, never cut: "+N items" ("+1 item"), else "+N", else
+/// nothing ("+1" of "+12" would say one item).
+fn rest_label(count: usize, room: usize) -> String {
+    let full = match count {
+        1 => "+1 item".to_string(),
+        n => format!("+{n} items"),
+    };
+    let short = format!("+{count}");
+    match room {
+        r if full.len() <= r => full,
+        r if short.len() <= r => short,
+        _ => String::new(),
+    }
+}
+
+/// The list inside the rest's frame, over `inside`: what it holds (`rest`, `count` of them),
+/// largest first, a line each: the name at the left, the size and the share at the right
+/// (`lines`). A line shows only whole: an item whose name, size and share do not fit is told in
+/// "+N more", with those the rows have no room for; that line too shows only whole, and under
+/// one item at least (alone it would say the label again). The selected item's line is
+/// reversed, so it shows without colour too. Only a few more items than rows are looked at
+/// (each costs a name, a size and a share, and a folder may hand 166 000 to every drawing);
+/// "+N more" counts all the others.
+fn rest_list(
+    rest: impl Iterator<Item = usize>,
+    count: usize,
+    lines: impl Fn(usize) -> (String, String, String),
+    selected: Option<usize>,
+    inside: Rect,
+    style: Style,
+    buf: &mut Buffer,
+) {
+    let (room, rows) = (inside.width as usize, usize::from(inside.height));
+    if rows == 0 || room < REST_LINE_LEAST {
+        return;
+    }
+    let line = |k: usize| {
+        let (name, size, share) = lines(k);
+        let right = format!("{size}  {share:>4}");
+        (width(&name) + 2 + width(&right) <= room).then_some((name, right))
+    };
+    let mut whole: Vec<(usize, String, String)> = Vec::new();
+    for k in rest.take(4 * rows + 16) {
+        if whole.len() > rows {
+            break;
+        }
+        if let Some((name, right)) = line(k) {
+            whole.push((k, name, right));
+        }
+    }
+    let listed = match whole.len() == count && count <= rows {
+        true => count,
+        false => whole.len().min(rows.saturating_sub(1)),
+    };
+    let more = format!("+{} more", count - listed);
+    if listed == 0 || (listed < count && width(&more) > room) {
+        return;
+    }
+    for (row, (k, name, right)) in whole.iter().take(listed).enumerate() {
+        let y = inside.y + row as u16;
+        let st = match selected == Some(*k) {
+            true => style.add_modifier(Modifier::REVERSED),
+            false => style,
+        };
+        buf.set_style(Rect::new(inside.x, y, inside.width, 1), st);
+        put(buf, inside.x, y, name, inside.width, st);
+        let right_w = width(right) as u16;
+        put(buf, inside.right() - right_w, y, right, right_w, st);
+    }
+    if listed < count {
+        put(
+            buf,
+            inside.x,
+            inside.y + listed as u16,
+            &more,
+            inside.width,
+            style,
+        );
+    }
+}
+
 /// A box's edges, in the set's border glyphs, inside `r`: the cells it covers keep their place.
 fn outline(r: Rect, style: Style, look: &Look, buf: &mut Buffer) {
     if r.width < 2 || r.height < 2 {
@@ -848,7 +1221,8 @@ fn outline(r: Rect, style: Style, look: &Look, buf: &mut Buffer) {
 }
 
 /// The trash dialog. It shows the whole path, wrapped and escaped (`shown`); if the window
-/// cannot hold it all, it says so, and the item cannot be moved (`Confirm::fits`).
+/// cannot hold it all, it says so, and the item cannot be moved (`Confirm::fits`). For several
+/// items: `dialog_many`.
 fn dialog(
     c: &mut Confirm,
     tree: &Tree,
@@ -858,12 +1232,19 @@ fn dialog(
     hits: &mut Hits,
     look: &Look,
 ) {
+    if c.empty {
+        return dialog_empty(c, tree, area, buf, hits, look);
+    }
+    if !c.one() {
+        return dialog_many(c, tree, apparent, area, buf, hits, look);
+    }
     let (k, g) = (&look.c, look.g);
-    let n = tree.node(c.id);
+    let (id, path) = &c.items[0];
+    let n = tree.node(*id);
     let linked = n.flags & (LINKED | HARDLINK_DUP) != 0;
     let w = area.width.saturating_sub(2).min(80);
     let iw = w.saturating_sub(4);
-    let lines = wrap(&shown(c.path.as_os_str()), iw as usize);
+    let lines = wrap(&shown(path.as_os_str()), iw as usize);
     // Border, blank, the path, the size, (hard links), the trash line, blank, buttons, border.
     let full = 7 + lines.len() as u16 + u16::from(linked);
     c.fits = iw >= 33 && full <= area.height;
@@ -875,7 +1256,12 @@ fn dialog(
         h,
     );
     let style = Style::new().bg(k.widget_bg).fg(k.widget_fg);
-    frame(r, " Move to the trash? ", style, look, buf);
+    // From the ticks: the item is the ticked one, not the selected row.
+    let title = match c.ticked {
+        true => " Move the ticked item to the trash? ",
+        false => " Move to the trash? ",
+    };
+    frame(r, title, style, look, buf);
     let x = r.x + 2;
     let mut y = r.y + 2;
     if c.fits {
@@ -886,7 +1272,11 @@ fn dialog(
         }
         let size = fmt_size(if apparent { n.apparent } else { n.alloc });
         let what = if n.is_dir() {
-            format!("{size}  {}  {} items", g.dot, n.items)
+            format!(
+                "{size}  {}  {}",
+                g.dot,
+                count(tree.items(*id).into(), "item")
+            )
         } else {
             size
         };
@@ -905,17 +1295,210 @@ fn dialog(
         y += 1;
         put(buf, x, y, "make it larger, or press Esc.", iw, style);
     }
-    y += 2;
-    // termcode's buttons: the one with the focus primary (and bold), the other secondary. A
-    // Move to Trash that cannot be used yet (or here: the path does not fit) is dim and
-    // crossed out as well as grey.
+    buttons(c, x, y + 2, buf, hits, look);
+}
+
+/// The dialog to empty the trash: how many items and how much disk, its whole path, and that
+/// they go for good. As the trash dialog, nothing goes while the window cannot show it all.
+fn dialog_empty(
+    c: &mut Confirm,
+    tree: &Tree,
+    area: Rect,
+    buf: &mut Buffer,
+    hits: &mut Hits,
+    look: &Look,
+) {
+    let k = &look.c;
+    let (id, path) = &c.items[0];
+    let w = area.width.saturating_sub(2).min(80);
+    let iw = w.saturating_sub(4);
+    let what = format!(
+        "{}, {} on disk, in",
+        count(trash_items(tree, *id) as u64, "item"),
+        fmt_size(tree.node(*id).alloc)
+    );
+    let path = wrap(&shown(path.as_os_str()), iw as usize);
+    let note = "will be deleted permanently. This cannot be undone.";
+    let note = wrap(note, iw as usize);
+    // Border, blank, what, the path, the note, blank, buttons, border.
+    let full = 6 + (path.len() + note.len()) as u16;
+    c.fits = iw >= 33 && full <= area.height;
+    let h = if c.fits { full } else { 7 };
+    let r = Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    );
+    let style = Style::new().bg(k.widget_bg).fg(k.widget_fg);
+    frame(r, " Empty the trash? ", style, look, buf);
+    let x = r.x + 2;
+    let mut y = r.y + 2;
+    if c.fits {
+        let bold = style.add_modifier(Modifier::BOLD);
+        put(buf, x, y, &what, iw, bold);
+        for line in &path {
+            y += 1;
+            put(buf, x, y, line, iw, bold);
+        }
+        for line in &note {
+            y += 1;
+            put(buf, x, y, line, iw, style);
+        }
+    } else {
+        let note = "The window is too small to show the whole path:";
+        put(buf, x, y, note, iw, style);
+        y += 1;
+        put(buf, x, y, "make it larger, or press Esc.", iw, style);
+    }
+    buttons(c, x, y + 2, buf, hits, look);
+}
+
+/// The dialog for several items (the ticked ones): their count and total, then every path,
+/// whole, wrapped and escaped, in a list that scrolls; after them the ticked items the guard
+/// refused, each with the lock and why. Move to Trash works only once every path to move has
+/// been shown whole (`Confirm::seen`: the lines jumped over by End do not count), and while
+/// the dialog has room for the list (`Confirm::fits`).
+fn dialog_many(
+    c: &mut Confirm,
+    tree: &Tree,
+    apparent: bool,
+    area: Rect,
+    buf: &mut Buffer,
+    hits: &mut Hits,
+    look: &Look,
+) {
+    let (k, g) = (&look.c, look.g);
+    let w = area.width.saturating_sub(2).min(80);
+    let iw = w.saturating_sub(4);
+    // The list's lines: each with whether it is a path to move (in full colour) and the first
+    // line of the entry it is part of; and the lines each path to move takes.
+    let mut lines: Vec<(String, bool, usize)> = Vec::new();
+    let mut spans = Vec::new();
+    for (_, path) in &c.items {
+        let start = lines.len();
+        let path = wrap(&shown(path.as_os_str()), iw as usize);
+        lines.extend(path.into_iter().map(|l| (l, true, start)));
+        spans.push(start..lines.len());
+    }
+    if !c.refused.is_empty() {
+        let head = format!("Not moved ({}):", c.refused.len());
+        lines.push((head, false, lines.len()));
+        for (path, why) in &c.refused {
+            let (start, text) = (
+                lines.len(),
+                format!("{} {}: {}", g.lock, shown(path.as_os_str()), clean(why)),
+            );
+            lines.extend(
+                wrap(&text, iw as usize)
+                    .into_iter()
+                    .map(|l| (l, false, start)),
+            );
+        }
+    }
+    let linked = c.items.iter().any(|(id, _)| {
+        let n = tree.node(*id);
+        n.flags & (LINKED | HARDLINK_DUP) != 0
+    });
+    // Border, blank, the total, the list, where in it, (hard links), the trash line, blank,
+    // buttons, border.
+    let fixed = 8 + u16::from(linked);
+    let n_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let list = area.height.saturating_sub(fixed).min(n_lines);
+    let ok = iw >= 33 && list >= n_lines.min(3);
+    let h = if ok { fixed + list } else { 7 };
+    let r = Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    );
+    let style = Style::new().bg(k.widget_bg).fg(k.widget_fg);
+    let title = format!(
+        " Move {} to the trash? ",
+        count(c.items.len() as u64, "item")
+    );
+    frame(r, &title, style, look, buf);
+    let x = r.x + 2;
+    let mut y = r.y + 2;
+    if ok {
+        let (mut size, mut held) = (0, 0);
+        for (id, _) in &c.items {
+            let n = tree.node(*id);
+            size += if apparent { n.apparent } else { n.alloc };
+            held += u64::from(tree.items(*id));
+        }
+        let held = count(held, "item");
+        let what = format!("{}  {}  {held} in them", fmt_size(size), g.dot);
+        put(buf, x, y, &what, iw, style.add_modifier(Modifier::BOLD));
+        y += 1;
+        let list = usize::from(list);
+        c.scroll = c.scroll.min(lines.len() - list);
+        c.page = list;
+        // The next page starts at the entry the bottom edge cuts, so none is split twice.
+        let next = c.scroll + list;
+        c.next_page = match lines.get(next) {
+            Some(&(_, _, start)) if start > c.scroll => start,
+            _ => next,
+        };
+        for (line, moves, _) in lines.iter().skip(c.scroll).take(list) {
+            let st = if *moves { style } else { style.fg(k.dim) };
+            put(buf, x, y, line, iw, st);
+            y += 1;
+        }
+        // A path is seen once all its lines were on screen together.
+        let on_screen = c.scroll..c.scroll + list;
+        for (seen, span) in c.seen.iter_mut().zip(&spans) {
+            *seen |= on_screen.start <= span.start && span.end <= on_screen.end;
+        }
+        let [up_down, ..] = g.keys;
+        let mut place = String::new();
+        if lines.len() > list {
+            let (from, to) = (c.scroll + 1, c.scroll + list);
+            place = format!(
+                "lines {from}-{to} of {}  {}  {up_down} PgUp PgDn",
+                lines.len(),
+                g.dot
+            );
+        }
+        if !c.seen.iter().all(|&s| s) {
+            place.push_str("  (Move once every path was shown)");
+        }
+        put(buf, x, y, &place, iw, style.fg(k.dim));
+        y += 1;
+        if linked {
+            let note = "Some have other hard links: moving them may free nothing.";
+            put(buf, x, y, note, iw, style);
+            y += 1;
+        }
+        let note = "The space is freed only when the trash is emptied.";
+        put(buf, x, y, note, iw, style);
+    } else {
+        let note = "The window is too small to show every path:";
+        put(buf, x, y, note, iw, style);
+        y += 1;
+        put(buf, x, y, "make it larger, or press Esc.", iw, style);
+    }
+    c.fits = ok && c.seen.iter().all(|&s| s);
+    buttons(c, x, y + 2, buf, hits, look);
+}
+
+/// termcode's buttons, Cancel and Move to Trash (Empty Trash), at line `y`: the one with the
+/// focus primary (and bold), the other secondary. A Move to Trash that cannot be used yet (or
+/// here: a path is not shown) is crossed out; without the focus, dim and grey as well.
+fn buttons(c: &Confirm, x: u16, y: u16, buf: &mut Buffer, hits: &mut Hits, look: &Look) {
+    let k = &look.c;
     let primary = Style::new()
         .bg(k.button_bg)
         .fg(k.button_fg)
         .add_modifier(Modifier::BOLD);
     let secondary = Style::new().bg(k.button2_bg).fg(k.button2_fg);
+    let label = match c.empty {
+        true => "[ Empty Trash ]",
+        false => "[ Move to Trash ]",
+    };
     let cancel = Rect::new(x + 2, y, 10, 1);
-    let moving = Rect::new(x + 16, y, 17, 1);
+    let moving = Rect::new(x + 16, y, width(label) as u16, 1);
     // Hover lightens a button that takes a click; a disabled one stays as it is.
     let lit = |r: Rect, s: Style, main: bool| match (look.over(r), main) {
         (false, _) => s,
@@ -935,29 +1518,22 @@ fn dialog(
         cancel_style,
     );
     // Disabled exactly when a click would not move it (`clickable`): the same rule, no other.
+    // The focus may come before it can be used (Tab works at once): then the focus's colours,
+    // crossed out.
     let move_style = if !c.clickable() {
-        let off = Style::new()
-            .bg(k.button2_bg)
-            .fg(k.disabled)
-            .add_modifier(Modifier::CROSSED_OUT | Modifier::DIM);
-        if c.on_move {
-            off.add_modifier(Modifier::BOLD)
-        } else {
-            off
+        match c.on_move {
+            true => primary.add_modifier(Modifier::CROSSED_OUT),
+            false => Style::new()
+                .bg(k.button2_bg)
+                .fg(k.disabled)
+                .add_modifier(Modifier::CROSSED_OUT | Modifier::DIM),
         }
     } else if c.on_move {
         lit(moving, primary, true)
     } else {
         lit(moving, secondary, false)
     };
-    put(
-        buf,
-        moving.x,
-        moving.y,
-        "[ Move to Trash ]",
-        moving.width,
-        move_style,
-    );
+    put(buf, moving.x, moving.y, label, moving.width, move_style);
     hits.buttons = Some((cancel, moving));
 }
 
@@ -967,13 +1543,20 @@ fn help(area: Rect, buf: &mut Buffer, look: &Look) {
         format!("{up_down}  PgUp PgDn"),
         format!("{right_left}  + -"),
     );
-    let keys: [(&str, &str); 20] = [
+    let part = format!("{} (tree)", look.g.boxes[2]);
+    let keys: [(&str, &str); 23] = [
         (&moves, "move"),
         (&opens, "open, close a folder"),
         ("double click (tree)", "open, close a folder"),
         ("Enter, double click (map)", "show that folder"),
         ("Backspace", "show the folder above"),
         ("Del", "move to the trash (asks first)"),
+        ("Del on the trash", "empty it for good (asks first)"),
+        (
+            "Space, box, drag (tree)",
+            "tick, untick; Del: the ticked ones",
+        ),
+        (&part, "not ticked, but something in it is"),
         ("o", "open with the default program"),
         ("c", "copy the path"),
         ("a", "disk usage / apparent size"),
@@ -981,7 +1564,7 @@ fn help(area: Rect, buf: &mut Buffer, look: &Look) {
         ("s, S", "sort the tree: next column / reverse"),
         ("v", "tree and map / tree / map"),
         ("r", "scan again"),
-        ("Esc", "stop a scan, close a dialog"),
+        ("Esc", "stop a scan, close a dialog, clear the ticks"),
         ("click", "select (tree or map), sort (heading)"),
         ("?", "this help"),
         ("q", "quit"),
@@ -1156,6 +1739,36 @@ fn fit_middle(s: &str, w: usize, cut: &str) -> String {
     format!("{head}{cut}{}", tail.into_iter().collect::<String>())
 }
 
+/// The title in `room` cells: its parts with `sep` between them. What gives way first is the
+/// first part: a path (`path`) is cut in its middle while it keeps `TITLE_MIN` cells, other
+/// text shows whole or not at all. Then the parts between it and the last go, from the last
+/// one back; then the first part goes; the last (termdisk and its version) is cut only where
+/// it alone has no room.
+fn fit_title(parts: &[String], path: bool, sep: &str, room: usize, cut: &str) -> String {
+    let [first, middle @ .., last] = parts else {
+        return parts
+            .first()
+            .map_or_else(String::new, |p| fit_end(p, room, cut));
+    };
+    let gap = format!("  {sep}  ");
+    let least = match path {
+        true => TITLE_MIN.min(width(first)),
+        false => width(first),
+    };
+    for keep in (0..=middle.len()).rev() {
+        let tail: String = middle[..keep]
+            .iter()
+            .chain([last])
+            .map(|p| format!("{gap}{p}"))
+            .collect();
+        if width(&tail) + least <= room {
+            let free = room - width(&tail);
+            return format!("{}{tail}", fit_middle(first, free, cut));
+        }
+    }
+    fit_end(last, room, cut)
+}
+
 /// A thin bar `w` cells long, `share` (0 to 1) of it filled in half cells: the filled part and
 /// the track after it.
 fn bar(share: f64, w: u16, g: &Glyphs) -> (String, String) {
@@ -1199,6 +1812,14 @@ fn draw_bar(buf: &mut Buffer, x: u16, y: u16, share: f64, w: u16, style: Style, 
     );
 }
 
+/// `n` of `thing`: "1 item", "2 items".
+pub(crate) fn count(n: u64, thing: &str) -> String {
+    match n {
+        1 => format!("1 {thing}"),
+        n => format!("{n} {thing}s"),
+    }
+}
+
 /// An icon and the space after it, or nothing for no icon.
 fn icon_gap(icon: &str) -> String {
     if icon.is_empty() {
@@ -1237,6 +1858,105 @@ mod tests {
         assert_eq!(bar(0.3, 5, ascii), ("=-".to_string(), "   ".to_string()));
         let (f, r) = bar(0.33, 10, unicode);
         assert_eq!(width(&f) + width(&r), 10);
+    }
+
+    #[test]
+    fn a_reason_box_stays_inside_its_area_at_every_edge() {
+        let look = Look {
+            c: Colors::default(),
+            g: IconSet::Ascii.glyphs(),
+            pointer: None,
+        };
+        let why = "protected: ~/.config, with everything in it"; // 43 cells: wider than the area
+        let area = Rect::new(2, 1, 30, 10);
+        let (right, bottom) = (area.right() - 2, area.bottom() - 1);
+        for (anchor, short) in [
+            (Rect::new(2, 1, 2, 1), false),
+            (Rect::new(right, 1, 2, 1), false),
+            (Rect::new(right, bottom, 2, 1), false),
+            (Rect::new(2, bottom, 2, 1), true),
+            (Rect::new(12, 5, 2, 1), true),
+        ] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 40, 14));
+            for c in buf.content.iter_mut() {
+                c.set_symbol("X");
+            }
+            let text = if short { "a mount point: /m" } else { why };
+            tooltip(text, anchor, area, &mut buf, &look);
+            let at = format!("{anchor:?}");
+            for (i, c) in buf.content.iter().enumerate() {
+                let (x, y) = ((i % 40) as u16, (i / 40) as u16);
+                let inside = x >= area.x && x < area.right() && y >= area.y && y < area.bottom();
+                assert!(inside || c.symbol() == "X", "({x}, {y}) for {at}");
+            }
+            // Under the lock where it has room, else over it; at the lock's column, else as
+            // far right as it fits.
+            let top = match anchor.y + 4 <= area.bottom() {
+                true => anchor.y + 1,
+                false => anchor.y - 3,
+            };
+            let w = (width(text) as u16 + 4).min(area.width);
+            let x = anchor.x.min(area.right() - w);
+            assert_eq!(buf[(x, top)].symbol(), "+", "{at}");
+            let line: String = (x + 2..x + w - 2)
+                .map(|x| buf[(x, top + 1)].symbol())
+                .collect();
+            match short {
+                true => assert_eq!(line, text, "{at}"),
+                false => assert!(
+                    line.starts_with("protected:") && line.ends_with('~'),
+                    "{at}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn the_title_gives_way_path_first_and_the_version_last() {
+        let parts = [
+            "/home/me/a/long/path/to/photos",
+            "4.4 MB (disk usage)",
+            "termdisk v9.9.9",
+        ];
+        let parts: Vec<String> = parts.map(String::from).into();
+        let t = |room| fit_title(&parts, true, "-", room, "~");
+        let all = "/home/me/a/long/path/to/photos  -  4.4 MB (disk usage)  -  termdisk v9.9.9";
+        assert_eq!(t(100), all);
+        assert_eq!(t(74), all);
+        // The path is cut in its middle first...
+        assert_eq!(
+            t(60),
+            "/home/me~/photos  -  4.4 MB (disk usage)  -  termdisk v9.9.9"
+        );
+        assert_eq!(width(&t(54)), 54);
+        // ...to TITLE_MIN cells; then the size goes, and the path has room again.
+        assert_eq!(t(53), "/home/me/a/long/path/to/photos  -  termdisk v9.9.9");
+        assert_eq!(width(&t(30)), 30);
+        // The version alone, then cut itself only where it has no room.
+        assert_eq!(t(29), "termdisk v9.9.9");
+        assert_eq!(t(15), "termdisk v9.9.9");
+        assert_eq!(t(10), "termdisk ~");
+        assert_eq!(fit_title(&parts[2..], true, "-", 10, "~"), "termdisk ~");
+        // With a note between the size and the version: the path is cut first, then the parts
+        // between go from the last one back, so the size stays longest.
+        let mut four = parts.clone();
+        four.insert(2, "look only: on another filesystem than the trash".into());
+        let t = |room| fit_title(&four, true, "-", room, "~");
+        assert_eq!(width(&t(126)), 126);
+        assert!(t(126).contains("/home/me/a/long/path/to/photos"));
+        let cut = t(112);
+        assert!(cut.contains("me~/photos") && cut.contains("look only") && width(&cut) == 112);
+        let at_80_cols = t(72);
+        assert!(at_80_cols.contains("(disk usage)") && !at_80_cols.contains("look only"));
+        assert_eq!(width(&at_80_cols), 72);
+        assert_eq!(t(53), "/home/me/a/long/path/to/photos  -  termdisk v9.9.9");
+        // Text that is not a path shows whole or not at all.
+        let start: Vec<String> = ["choose what to look at", "termdisk v9.9.9"]
+            .map(String::from)
+            .into();
+        let t = |room| fit_title(&start, false, "-", room, "~");
+        assert_eq!(t(42), "choose what to look at  -  termdisk v9.9.9");
+        assert_eq!(t(41), "termdisk v9.9.9");
     }
 
     #[test]

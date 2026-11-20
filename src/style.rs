@@ -84,6 +84,10 @@ pub struct Colors {
     pub column_line: Color,
     /// The tree's scrollbar (`scrollbarSlider.background`, opaque: it is drawn as a glyph).
     pub slider: Color,
+    /// A ticked row's tint (`list.inactiveSelectionBackground`) and its ticked box
+    /// (`testing.iconPassed`); the box also shows without colour.
+    pub tick_bg: Color,
+    pub tick_fg: Color,
 }
 
 const fn rgb(v: u32) -> Color {
@@ -145,6 +149,8 @@ impl Default for Colors {
             slider: rgb(0x797979),
             close_fg: rgb(0xF14C4C), // errorForeground
             close_hover: rgb(0xE81123),
+            tick_bg: rgb(0x37373D),
+            tick_fg: rgb(0x89D185),
         }
     }
 }
@@ -203,6 +209,8 @@ impl Colors {
             slider: f(self.slider),
             close_fg: f(self.close_fg),
             close_hover: f(self.close_hover),
+            tick_bg: f(self.tick_bg),
+            tick_fg: f(self.tick_fg),
         }
     }
 }
@@ -282,13 +290,13 @@ pub enum IconSet {
     Ascii,
 }
 
-/// One icon set's glyphs. Every one is one cell wide; an empty icon is no icon.
+/// One icon set's glyphs. Every one is one cell wide but ASCII's tick boxes; an empty icon is
+/// no icon.
 pub(crate) struct Glyphs {
     pub closed: &'static str,
     pub open: &'static str,
     pub folder: &'static str,
     pub folder_open: &'static str,
-    pub file: &'static str,
     pub lock: &'static str,
     /// The selected row's left edge, the selected tile's first cell.
     pub mark: &'static str,
@@ -313,6 +321,13 @@ pub(crate) struct Glyphs {
     pub guide: &'static str,
     /// The close button's cross.
     pub close: &'static str,
+    /// A row's tick box, in its icon's place: not ticked, ticked (or in a ticked folder), not
+    /// ticked but holding a ticked item. A click on it ticks the row, or takes the tick off.
+    pub boxes: [&'static str; 3],
+    /// The gutter row under a map tile, drawn in the tile's colour: its upper half only, so the
+    /// gap between rows of tiles looks as wide as the one-column gap between tiles (a cell is
+    /// about twice as tall as it is wide). None in ASCII: the whole row is the gap.
+    pub half_row: &'static str,
 }
 
 const NERD: Glyphs = Glyphs {
@@ -320,7 +335,6 @@ const NERD: Glyphs = Glyphs {
     open: "\u{eab4}",
     folder: "\u{e5ff}",
     folder_open: "\u{e5fe}",
-    file: "\u{ea7b}",
     // The lock is a safety sign: the font-independent one, even here (a codicon is a blank box
     // where the set is forced without a Nerd Font).
     ..UNICODE
@@ -331,7 +345,6 @@ const UNICODE: Glyphs = Glyphs {
     open: "▾",
     folder: "",
     folder_open: "",
-    file: "▪",
     lock: "⊘",
     mark: "▌",
     border: ["╭", "╮", "╰", "╯", "─", "│"],
@@ -347,6 +360,9 @@ const UNICODE: Glyphs = Glyphs {
     sort: ["▴", "▾"],
     guide: "│",
     close: "✕", // not ×: that one is East Asian ambiguous
+    // Both East Asian width N: one cell everywhere.
+    boxes: ["☐", "☑", "◩"],
+    half_row: "▀", // a block element, as `mark` is
 };
 
 const ASCII: Glyphs = Glyphs {
@@ -354,7 +370,6 @@ const ASCII: Glyphs = Glyphs {
     open: "v",
     folder: "",
     folder_open: "",
-    file: "",
     lock: "!",
     mark: ">",
     border: ["+", "+", "+", "+", "-", "|"],
@@ -369,6 +384,8 @@ const ASCII: Glyphs = Glyphs {
     sort: ["^", "v"],
     guide: "|",
     close: "x",
+    boxes: ["[ ]", "[x]", "[-]"],
+    half_row: "",
 };
 
 impl IconSet {
@@ -468,8 +485,17 @@ mod tests {
                 g.close,
             ];
             assert!(one.iter().chain(g.spin).all(|s| s.width() == 1), "{set:?}");
-            let none_or_one = [g.folder, g.folder_open, g.file];
+            let none_or_one = [g.folder, g.folder_open, g.half_row];
             assert!(none_or_one.iter().all(|s| s.width() <= 1), "{set:?}");
+            // The boxes take the same cells (the names stay put as a tick comes and goes),
+            // even where East Asian ambiguous widths are wide; one cell but in ASCII.
+            let w = match set {
+                IconSet::Ascii => 3,
+                _ => 1,
+            };
+            for b in g.boxes {
+                assert_eq!((b.width(), b.width_cjk()), (w, w), "{set:?} {b}");
+            }
             assert!(
                 g.border
                     .iter()
@@ -482,6 +508,7 @@ mod tests {
         let a = IconSet::Ascii.glyphs();
         let all = [
             a.closed, a.open, a.lock, a.mark, a.sep, a.dot, a.cut, a.slider, a.check, a.guide,
+            a.boxes[0], a.boxes[1], a.boxes[2], a.half_row,
         ];
         assert!(all
             .iter()
