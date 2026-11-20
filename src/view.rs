@@ -3551,8 +3551,12 @@ mod tests {
         let mut v = ready(policy(&home, None), &home);
         select(&mut v, ".cache");
         key(&mut v, KeyCode::Enter); // shows .cache
-        let f3 = cache.join("big/inner/f3");
-        let id = browse(&mut v).tree.find(&f3).unwrap();
+                                     // inner's 16th file, far enough down to scroll: files of one size keep the order the
+                                     // filesystem lists them in, so the name differs from one filesystem to another.
+        let inner = browse(&mut v).tree.find(&cache.join("big/inner")).unwrap();
+        let id = browse(&mut v).ordered(inner)[15];
+        let file = browse(&mut v).tree.path(id);
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
         browse(&mut v).select(id); // opens big and inner
         text(&mut v, 120, 12);
         assert!(browse(&mut v).top > 0, "a short pane, scrolled");
@@ -3561,22 +3565,25 @@ mod tests {
         key(&mut v, KeyCode::Tab);
         browse(&mut v).confirm.as_mut().unwrap().focused -= REFOCUS;
         key(&mut v, KeyCode::Enter);
-        assert!(!f3.exists());
+        assert!(!file.exists());
         assert!(matches!(v.screen, Screen::Refreshing(..)), "scanning again");
         // Meanwhile the scan's card and the message; the last tree is gone, what it showed (as
         // the trash left it) kept by path.
         let lines = text(&mut v, 120, 12);
-        assert!(has(&lines, "Moved to the trash: f3"), "{lines:#?}");
+        assert!(
+            has(&lines, &format!("Moved to the trash: {name}")),
+            "{lines:#?}"
+        );
         assert!(has(&lines, "Scanning"), "{lines:#?}");
         let s = saved(&v);
         let (next, line) = (home.join(&s.selected), s.line);
         assert!(
-            next.starts_with(cache.join("big/inner")) && next != f3,
+            next.starts_with(cache.join("big/inner")) && next != file,
             "{next:?}"
         );
         settle(&mut v);
         let b = browse(&mut v);
-        assert!(b.tree.find(&f3).is_none(), "a new tree, from the disk");
+        assert!(b.tree.find(&file).is_none(), "a new tree, from the disk");
         assert_eq!(b.tree.path(b.zoom), cache, "the same folder shown");
         let open: Vec<PathBuf> = b.open.iter().map(|&i| b.tree.path(i)).collect();
         for p in [cache.join("big"), cache.join("big/inner")] {
@@ -4281,8 +4288,6 @@ mod tests {
             .tree
             .find(&cache.join("big/inner/f3"))
             .unwrap();
-        let b = browse(&mut v);
-        let (all, one) = (b.ticked_size(false), counted(b.tree.node(f3), false));
         // Space on f3: big's tick goes, what was in it but f3 stays ticked, each on its own.
         browse(&mut v).select(f3);
         key(&mut v, KeyCode::Char(' '));
@@ -4291,7 +4296,16 @@ mod tests {
         let mut want: Vec<String> = files.chain(["side".into()]).collect();
         want.sort();
         assert_eq!(names, want);
-        assert_eq!(browse(&mut v).ticked_size(false), all - one);
+        // Their sizes alone: big and inner no longer go (a folder takes blocks on ext4).
+        let b = browse(&mut v);
+        let size: u64 = (want.iter())
+            .map(|n| match n.as_str() {
+                "side" => cache.join("big/side"),
+                f => cache.join("big/inner").join(f),
+            })
+            .map(|p| counted(b.tree.node(b.tree.find(&p).unwrap()), false))
+            .sum();
+        assert_eq!(b.ticked_size(false), size);
         let lines = text(&mut v, 120, 40);
         for s in ["◩ big/", "◩ inner/", "☐ f3", "☑ f4", "☑ side"] {
             assert!(has(&lines, s), "{s}: {lines:#?}");
