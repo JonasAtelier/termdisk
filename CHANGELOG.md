@@ -2,7 +2,7 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
-## [0.4.0] - Unreleased
+## [0.4.0] - 2026-11-20
 
 ### Added
 - Ticks: Space ticks or unticks the selected row and goes on to the next; a drag with the left
