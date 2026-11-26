@@ -1,4 +1,4 @@
-<h1 align="right"><img src="doc/media/termdisk.gif" width="96%" alt="termdisk"></h1>
+<h1 align="right"><img src="doc/media/termdisk-drive-panel.gif" width="96%" alt="termdisk"></h1>
 
 ![Clicking a tile in the treemap selects the matching file in the folder tree.](doc/media/overview.gif)
 
