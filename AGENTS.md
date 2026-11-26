@@ -138,10 +138,15 @@ the token.
 The `binaries` job builds `termdisk-x86_64-unknown-linux-gnu.tar.gz` and
 `termdisk-aarch64-unknown-linux-gnu.tar.gz` (the binary, `LICENSE`, `THIRD-PARTY-LICENSES`,
 and the Rust standard library's `COPYRIGHT-library.html` from the toolchain that built it),
-each natively on a runner of its architecture (`ubuntu-24.04`, `ubuntu-24.04-arm`), read-only
+each natively on a runner of its architecture (`ubuntu-22.04`, `ubuntu-22.04-arm`), read-only
 and without secrets; `github-release` attaches them and `SHA256SUMS`. `cargo binstall` finds
 them through `[package.metadata.binstall]` in `Cargo.toml`: rename them in both places. They
-are glibc builds and need glibc 2.34 or newer (the job checks it, the README says it). Not a
+are glibc builds and need glibc 2.34 or newer (the job checks it, the README says it). That
+takes a glibc older than 2.39 to link against: std uses pidfd_spawnp and pidfd_getpid only
+where they exist, but linked against glibc 2.39 (Ubuntu 24.04) the binary recorded 2.39 as
+needed: in CI on aarch64, and locally on x86_64 with Rust 1.97.1's LLD and with GNU ld (a
+local Rust 1.100 build marked it weak). Move back to 24.04 runners, when GitHub retires 22.04,
+only once the glibc check passes there on both targets; otherwise the floor is 2.39. Not a
 static musl build: musl's malloc made `--summary` of 2.44 million entries (12 threads) take
 0.72 s against glibc's 0.43 s, and musl has no `malloc_trim` or `mallopt`. From the Actions tab
 the binaries are built and kept on the run's page, never attached to a Release.

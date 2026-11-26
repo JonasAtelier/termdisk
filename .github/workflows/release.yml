@@ -132,18 +132,23 @@ jobs:
   # The binaries on the GitHub Release, each built natively on a runner of its own
   # architecture with the publish job's Rust. glibc, as `cargo install` builds it, not a static
   # musl build: termdisk gives a scan's freed memory back with glibc's malloc_trim, and musl's
-  # malloc made a 12-thread scan 1.7 times as slow (AGENTS.md, "Releases"). Built on Ubuntu
-  # 24.04, a binary needs glibc 2.34 or newer, as the README says; the check keeps that true.
+  # malloc made a 12-thread scan 1.7 times as slow (AGENTS.md, "Releases"). Ubuntu 22.04, not
+  # 24.04: std calls pidfd_spawnp and pidfd_getpid only where libc has them, but linked against
+  # 24.04's glibc 2.39, which has them, both binaries recorded glibc 2.39 as needed (the check
+  # failed on aarch64; on x86_64 the same Rust did it locally with its LLD and with GNU ld), and
+  # would not start on an older one. 22.04's glibc 2.35 lacks both, so a binary needs glibc
+  # 2.34 or newer, as the README says; the check keeps that true.
   # This job runs the repository's code, so it gets nothing to write with and no secrets:
   # github-release attaches what it leaves.
   binaries:
     strategy:
+      fail-fast: false # each target's check is seen, even when the other fails
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     permissions:
