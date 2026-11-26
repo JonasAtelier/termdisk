@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="226" viewBox="0 0 920 226" role="img" aria-labelledby="title desc">
+  <title id="title">Scan time and peak memory</title>
+  <desc id="desc">On 2.05 million entries with a warm cache and 12 threads, termdisk summary took 0.47 seconds, ncdu 1.22 export took 2.50 seconds, and du took 3.31 seconds. In a separate run on 1.24 million entries, the interactive view used 88 MB peak memory including a rescan.</desc>
+  <rect width="920" height="226" rx="10" fill="#0b1009"/>
+  <path d="M582 27v172" stroke="#39462d"/>
+  <g font-family="system-ui, sans-serif" fill="#eef4e8">
+    <text x="24" y="35" font-size="20" font-weight="700">Scan time</text>
+    <text x="608" y="35" font-size="20" font-weight="700">Peak memory</text>
+    <g font-size="15" fill="#bdc8b5">
+      <text x="24" y="62">2.05M entries · warm cache · 12-thread machine</text>
+      <text x="608" y="62">1.24M entries · interactive view</text>
+    </g>
+    <g font-size="16">
+      <text x="24" y="108">termdisk summary</text>
+      <text x="24" y="150">ncdu 1.22 export</text>
+      <text x="24" y="192">du -sx</text>
+    </g>
+    <g fill="#a8ee35">
+      <rect x="177" y="94" width="40" height="15"/>
+      <text x="608" y="143" font-size="62" font-weight="700">88 MB</text>
+    </g>
+    <g fill="#688953">
+      <rect x="177" y="136" width="211" height="15"/>
+      <rect x="177" y="178" width="280" height="15"/>
+    </g>
+    <g font-size="16" font-family="monospace">
+      <text x="228" y="108">0.47 s</text>
+      <text x="399" y="150">2.50 s</text>
+      <text x="468" y="192">3.31 s</text>
+    </g>
+    <text x="608" y="183" font-size="16" fill="#bdc8b5">Includes a rescan of the folder.</text>
+  </g>
+</svg>
