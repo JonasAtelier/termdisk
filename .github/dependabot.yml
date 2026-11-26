@@ -1,0 +1,16 @@
+# Updates to the actions the workflows use, once a month, all in one pull request: each moves
+# a pinned commit SHA and its version comment together, and ci.yml checks it like any other.
+#
+# No cargo entry: termdisk's crates are the versions termcode's Cargo.lock has, so embedding
+# termdisk adds no crate (AGENTS.md, "Build and test"), and an update on its own would break
+# that. A crate with a security advisory still gets a pull request: that comes from the
+# repository's Dependabot security updates setting, which needs nothing in this file.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

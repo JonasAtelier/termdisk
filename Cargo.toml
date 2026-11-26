@@ -20,3 +20,10 @@ libc = "0.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 # Cell widths of names (CJK) when cutting them to fit; already in ratatui's tree.
 unicode-width = "0.2"
+
+# `cargo binstall termdisk` takes the binary from the GitHub Release instead of building it. The
+# names are the archives release.yml makes: change both together.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"

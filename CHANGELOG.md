@@ -2,6 +2,15 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
+## [0.5.0] - Unreleased
+
+### Added
+- `--version` (and `-V`) prints termdisk's version.
+- Prebuilt binaries for x86_64 and aarch64 Linux on each GitHub Release, with `SHA256SUMS`; they
+  need glibc 2.34 or newer. `cargo binstall termdisk` installs them. `THIRD-PARTY-LICENSES` now
+  lists the licence of every crate built into them, and ships in each archive.
+- `SECURITY.md`: report a vulnerability privately, through GitHub.
+
 ## [0.4.1] - 2026-11-26
 
 ### Changed

@@ -24,10 +24,12 @@ use termdisk::{fmt_size, Colors, Depth, IconSet, NodeId, Outcome, Policy, View};
 
 const USAGE: &str = "usage: termdisk [--read-only] [PATH]
        termdisk --summary [PATH]
+       termdisk --version
 
   PATH          scan PATH at once (without it: choose home, cache, /tmp or the trash)
   --read-only   look only: nothing can be moved to the trash
   --summary     scan PATH (default: the current folder), print its totals and exit
+  --version     print termdisk's version and exit
 
   TERMDISK_COLORS=truecolor|256|16   the terminal's colours (default: from the environment)
   TERMDISK_ICONS=nerd|unicode|ascii  the glyphs (default: nerd when a Nerd Font is installed)
@@ -61,6 +63,10 @@ fn main() -> ExitCode {
             Some("--read-only") => read_only = true,
             Some("-h" | "--help") => {
                 print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            Some("-V" | "--version") => {
+                println!("termdisk {}", env!("CARGO_PKG_VERSION"));
                 return ExitCode::SUCCESS;
             }
             Some(s) if s.starts_with('-') => {

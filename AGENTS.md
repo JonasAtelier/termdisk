@@ -97,6 +97,9 @@ memory, never more than 4. No parallel cargo runs.
 - Dependencies use the versions termcode has, so embedding adds no crate: every crate and
   version in `cargo tree -e normal` is in termcode's `Cargo.lock` (pin with `cargo update -p
   NAME --precise VERSION`); the one duplicate, syn 2 and 3, is ratatui's and termcode has it too.
+- `THIRD-PARTY-LICENSES` lists every crate built into the release binaries with its licence
+  text. After any change to `Cargo.lock`, run `scripts/notices.sh` (it rewrites that list from
+  `cargo tree` and the crates' own licence files) and commit what it changed.
 - `scripts/bench.sh [BINARY] [DIR]`: wall and max RSS (medians of 5) of `du -sx`, ncdu and
   `termdisk --summary` on DIR (default `$HOME`), the totals against `du` and `find`, bytes per
   entry. Run it before and after any change to the scan or the tree (`cargo build -j4
@@ -125,10 +128,23 @@ tests with the skipped ones as warnings, dependency licences, the package, rust-
 read-only permissions and no secrets. `.github/workflows/release.yml` runs on a `v*` tag:
 those checks, the tag against `Cargo.toml` and `CHANGELOG.md`, a check that the `crates-io`
 environment requires a reviewer, then `cargo publish` once the owner approves, then the GitHub
-Release with that version's CHANGELOG section. Rust is pinned in `ci.yml` and in
-`release.yml`'s publish job (`RUSTUP_TOOLCHAIN`, the same version: a release checks it); bump
-both on purpose. Actions are pinned by commit SHA. A release refuses a `.cargo/config*` or a
-`rust-toolchain*` file in the repository: they would run beside the token.
+Release with that version's CHANGELOG section, the binaries and `SHA256SUMS`. Rust is pinned in
+`ci.yml` and in `release.yml`'s publish and binaries jobs (`RUSTUP_TOOLCHAIN`, the same
+version: a release checks it); bump them together, on purpose. Actions are pinned by commit
+SHA; Dependabot (`.github/dependabot.yml`) proposes their updates once a month. A release
+refuses a `.cargo/config*` or a `rust-toolchain*` file in the repository: they would run beside
+the token.
+
+The `binaries` job builds `termdisk-x86_64-unknown-linux-gnu.tar.gz` and
+`termdisk-aarch64-unknown-linux-gnu.tar.gz` (the binary, `LICENSE`, `THIRD-PARTY-LICENSES`,
+and the Rust standard library's `COPYRIGHT-library.html` from the toolchain that built it),
+each natively on a runner of its architecture (`ubuntu-24.04`, `ubuntu-24.04-arm`), read-only
+and without secrets; `github-release` attaches them and `SHA256SUMS`. `cargo binstall` finds
+them through `[package.metadata.binstall]` in `Cargo.toml`: rename them in both places. They
+are glibc builds and need glibc 2.34 or newer (the job checks it, the README says it). Not a
+static musl build: musl's malloc made `--summary` of 2.44 million entries (12 threads) take
+0.72 s against glibc's 0.43 s, and musl has no `malloc_trim` or `mallopt`. From the Actions tab
+the binaries are built and kept on the run's page, never attached to a Release.
 
 No token is stored. The publish job uses crates.io's Trusted Publishing:
 `rust-lang/crates-io-auth-action` trades GitHub's OIDC token for a crates.io token that lasts

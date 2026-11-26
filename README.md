@@ -1,17 +1,35 @@
 <h1 align="right"><img src="doc/media/termdisk-drive-panel.gif" width="96%" alt="termdisk"></h1>
 
+<p align="center">
+  <a href="https://crates.io/crates/termdisk"><img src="https://img.shields.io/crates/v/termdisk" alt="crates.io version"></a>
+  <a href="https://github.com/JonasAtelier/termdisk/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/JonasAtelier/termdisk/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status on main"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/crates/l/termdisk" alt="License: GPL-3.0-only"></a>
+</p>
+
 ![Clicking a tile in the treemap selects the matching file in the folder tree.](doc/media/overview.gif)
 
 Find what’s taking up space on Linux. Browse folders on the left and see their largest files on the right.
 
 ## Install
 
-1. Open a terminal on Linux. If you don’t have Rust 1.93 or newer, follow the [Rust installer](https://rust-lang.org/tools/install/) and reopen your terminal. It includes Cargo.
-2. Install termdisk with Cargo.
+1. Open a terminal on Linux.
+2. Install termdisk in one of two ways.
+   - **Prebuilt binary** for x86_64 or aarch64, with glibc 2.34 or newer (Ubuntu 22.04, Debian 12, Fedora 35, RHEL 9 or later). Download it, check it against the release’s checksums, and install it:
 
-   ```sh
-   cargo install termdisk --locked
-   ```
+     ```sh
+     t=termdisk-$(uname -m)-unknown-linux-gnu
+     curl -fLO https://github.com/JonasAtelier/termdisk/releases/latest/download/$t.tar.gz
+     curl -fLO https://github.com/JonasAtelier/termdisk/releases/latest/download/SHA256SUMS
+     sha256sum -c --ignore-missing SHA256SUMS &&
+       tar -xzf $t.tar.gz && sudo install -m 755 $t/termdisk /usr/local/bin/
+     ```
+
+     With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), `cargo binstall termdisk` does the same.
+   - **With Cargo.** If you don’t have Rust 1.93 or newer, follow the [Rust installer](https://rust-lang.org/tools/install/) and reopen your terminal. It includes Cargo.
+
+     ```sh
+     cargo install termdisk --locked
+     ```
 
 3. Try a read-only scan of your Downloads folder.
 

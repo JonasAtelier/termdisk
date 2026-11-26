@@ -2,10 +2,11 @@
 # v0.2.1): ci.yml's checks on that commit; the tag must name Cargo.toml's version, be on
 # main, and CHANGELOG.md must date it; the `crates-io` environment must require a reviewer;
 # then, once the owner approves, `cargo publish`, and a GitHub Release with that version's
-# CHANGELOG section.
+# CHANGELOG section, the Linux binaries (x86_64, aarch64) and their SHA256SUMS.
 #
 # Run from the Actions tab (workflow_dispatch), on a branch or on a tag, it only checks (the
-# checks and the environment): every publishing job requires a tag *push*.
+# checks and the environment) and builds the binaries, which stay on the run's page: every
+# publishing job requires a tag *push*.
 #
 # Setup (the environment, its reviewer, crates.io's Trusted Publishing configuration):
 # AGENTS.md, "Releases". No token is stored: the publish job gets one from crates.io for 30
@@ -128,8 +129,73 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked --no-verify
 
+  # The binaries on the GitHub Release, each built natively on a runner of its own
+  # architecture with the publish job's Rust. glibc, as `cargo install` builds it, not a static
+  # musl build: termdisk gives a scan's freed memory back with glibc's malloc_trim, and musl's
+  # malloc made a 12-thread scan 1.7 times as slow (AGENTS.md, "Releases"). Built on Ubuntu
+  # 24.04, a binary needs glibc 2.34 or newer, as the README says; the check keeps that true.
+  # This job runs the repository's code, so it gets nothing to write with and no secrets:
+  # github-release attaches what it leaves.
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: 1.97.1 # the publish job's (the tag job checks they agree)
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      # It runs, and needs no glibc newer than 2.34. A version marked WEAK is not needed: std
+      # uses what it names only where it is there.
+      - name: Check
+        run: |
+          bin=target/$TARGET/release/termdisk
+          "$bin" --version
+          "$bin" --summary .
+          glibc=$(readelf -V "$bin" | awk '/Name: GLIBC_/ && !/Flags: WEAK/ { sub("GLIBC_", "", $3); print $3 }' | sort -V | tail -1)
+          test -n "$glibc" || { echo "::error::no GLIBC version found in $bin"; exit 1; }
+          echo "needs glibc $glibc"
+          test "$(printf '%s\n' "$glibc" 2.34 | sort -V | tail -1)" = 2.34 ||
+            { echo "::error::the binary needs glibc $glibc, newer than the README's 2.34"; exit 1; }
+
+      # The archive's names are the ones Cargo.toml's [package.metadata.binstall] expects. Beside
+      # the binary, the notices THIRD-PARTY-LICENSES points to: the standard library's, from
+      # this toolchain (its rustc component, so the minimal profile has it).
+      - name: Archive
+        run: |
+          name=termdisk-$TARGET
+          std_notices=$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html
+          test -f "$std_notices" || { echo "::error::no $std_notices in this Rust"; exit 1; }
+          mkdir "$name"
+          cp "target/$TARGET/release/termdisk" LICENSE THIRD-PARTY-LICENSES "$std_notices" "$name/"
+          tar -czf "$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: termdisk-${{ matrix.target }}
+          path: termdisk-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
   github-release:
-    needs: publish
+    needs: [publish, binaries]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -140,15 +206,33 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: GitHub Release with this version's CHANGELOG section
+      # The binaries job's archives: files to attach, nothing here runs them.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: termdisk-*
+          path: ${{ runner.temp }}/assets
+          merge-multiple: true
+
+      - name: GitHub Release with this version's CHANGELOG section, the binaries and SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           version=${GITHUB_REF_NAME#v}
-          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+          # A whole release is left as it is. One cut off while uploading (a draft, or short of
+          # the archives and SHA256SUMS) stops here: delete it (the tag stays), then "Re-run
+          # failed jobs" makes it again.
+          if release=$(gh release view "$GITHUB_REF_NAME" --json isDraft,assets 2> /dev/null); then
+            assets=$(( $(find "$RUNNER_TEMP/assets" -name 'termdisk-*.tar.gz' | wc -l) + 1 ))
+            if jq -e --argjson n "$assets" '.isDraft or (.assets | length) < $n' <<< "$release" > /dev/null; then
+              echo "::error::the release $GITHUB_REF_NAME is a draft or lacks some of its $assets assets: delete it (gh release delete $GITHUB_REF_NAME) and re-run failed jobs"
+              exit 1
+            fi
             echo "::notice::the release $GITHUB_REF_NAME exists already: left as it is"
             exit 0
           fi
           awk -v h="## [$version]" 'index($0, h) == 1 { on = 1; next } /^## \[/ { on = 0 } on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
-          gh release create "$GITHUB_REF_NAME" --verify-tag --title "termdisk $version" --notes-file "$RUNNER_TEMP/notes.md"
+          cd "$RUNNER_TEMP/assets"
+          sha256sum termdisk-*.tar.gz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "termdisk $version" --notes-file "$RUNNER_TEMP/notes.md" \
+            termdisk-*.tar.gz SHA256SUMS

@@ -1,0 +1,65 @@
+name: Bug report
+description: termdisk does something wrong, crashes, or draws something badly.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If termdisk moved or deleted a file it should not have, or read where it should not,
+        please do not open an issue: report it privately as [SECURITY.md](https://github.com/JonasAtelier/termdisk/blob/main/SECURITY.md) says.
+  - type: input
+    id: version
+    attributes:
+      label: termdisk version
+      description: What `termdisk --version` prints.
+      placeholder: termdisk 0.5.0
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution
+      description: The Linux distribution and its version, and the kernel (`uname -r`).
+      placeholder: Ubuntu 24.04, kernel 6.8.0
+    validations:
+      required: true
+  - type: input
+    id: filesystem
+    attributes:
+      label: Filesystem
+      description: Where the folder you scanned lives (`df -T PATH` shows it).
+      placeholder: ext4, btrfs, NFS, ...
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      description: The terminal, and the font if the glyphs look wrong.
+      placeholder: GNOME Terminal 3.52, JetBrainsMono Nerd Font
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The command you ran and the keys or clicks after it.
+      placeholder: |
+        1. termdisk --read-only ~/Downloads
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What you expected termdisk to do.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: What it did instead. A screenshot helps with anything drawn.
+    validations:
+      required: true

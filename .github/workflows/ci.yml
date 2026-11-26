@@ -27,7 +27,7 @@ jobs:
       CARGO_TERM_COLOR: always
       # The Rust this is developed with (rustc --version), as termcode pins it: a newer
       # stable's new lints would otherwise fail a release. Bump on purpose, here and in
-      # release.yml's publish job (a release checks the two agree).
+      # release.yml's publish and binaries jobs (a release checks they agree).
       RUSTUP_TOOLCHAIN: 1.97.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
