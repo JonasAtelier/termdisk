@@ -2,6 +2,12 @@
 
 What changed in each termdisk release, newest first. The version rule is in `AGENTS.md`.
 
+## [0.4.1] - 2026-11-26
+
+### Changed
+- README: an animated wordmark and demos of the treemap, navigation and drag to Trash, and a
+  quick install guide. termdisk itself is as in 0.4.0.
+
 ## [0.4.0] - 2026-11-20
 
 ### Added
